@@ -20,8 +20,8 @@ services:
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
     dns:
+      - 2a00:1098:2c::1
       - 2a01:4f8:c2c:123f::1
-      - 2001:4860:4860::8888
     volumes:
       - ./gen_images:/app/gen_images
       - ./bot.log:/app/bot.log
