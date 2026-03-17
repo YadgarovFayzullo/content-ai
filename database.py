@@ -1,7 +1,10 @@
+import os
 from sqlmodel import SQLModel, Field, create_engine, Session, select
 from datetime import datetime
 from typing import Optional, List
+from dotenv import load_dotenv
 
+load_dotenv()
 
 class Fact(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -18,10 +21,14 @@ class Channel(SQLModel, table=True):
     added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-sqlite_file_name = "facts.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+# Читаем DATABASE_URL из окружения, по умолчанию используем SQLite
+database_url = os.getenv("DATABASE_URL", "sqlite:///facts.db")
 
-engine = create_engine(sqlite_url)
+# Для PostgreSQL на некоторых платформах (например, Render) нужно заменить postgres:// на postgresql://
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(database_url)
 
 
 def create_db_and_tables():

@@ -1,15 +1,27 @@
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: content_ai_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres_pass}
+      POSTGRES_DB: ${DB_NAME:-content_ai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   bot:
     build: .
     container_name: content_ai_bot
     restart: always
+    depends_on:
+      - db
     env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
     volumes:
-      - ./facts.db:/app/facts.db
       - ./gen_images:/app/gen_images
       - ./bot.log:/app/bot.log
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+volumes:
+  postgres_data:
