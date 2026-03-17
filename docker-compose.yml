@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: content_ai_bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./facts.db:/app/facts.db
+      - ./gen_images:/app/gen_images
+      - ./bot.log:/app/bot.log
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

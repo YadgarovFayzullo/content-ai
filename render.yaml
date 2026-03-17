@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: daily-fact-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

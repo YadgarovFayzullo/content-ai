@@ -1,0 +1,7 @@
+python-dotenv
+aiogram
+google-genai
+sqlmodel
+apscheduler
+Pillow
+requests

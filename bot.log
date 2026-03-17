@@ -1,0 +1,88 @@
+2026-03-16 03:49:00,825 - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-03-16 03:49:00,827 - INFO - Added job "scheduled_job" to job store "default"
+2026-03-16 03:49:00,827 - INFO - Scheduler started
+2026-03-16 03:49:00,827 - INFO - Bot va Scheduler ishga tushdi...
+2026-03-16 03:49:00,827 - INFO - Start polling
+2026-03-16 03:49:01,510 - INFO - Run polling for bot @sciencecontent_bot id=8798971690 - 'Content AI'
+2026-03-16 03:49:03,257 - INFO - Update id=485442901 is handled. Duration 1267 ms by bot id=8798971690
+2026-03-16 03:49:03,266 - INFO - Update id=485442899 is handled. Duration 1289 ms by bot id=8798971690
+2026-03-16 03:49:03,511 - INFO - Update id=485442900 is handled. Duration 1533 ms by bot id=8798971690
+2026-03-16 03:50:06,757 - INFO - Update id=485442902 is handled. Duration 186 ms by bot id=8798971690
+2026-03-16 03:50:19,050 - INFO - Update id=485442903 is handled. Duration 159 ms by bot id=8798971690
+2026-03-16 03:50:23,466 - INFO - Update id=485442904 is handled. Duration 170 ms by bot id=8798971690
+2026-03-16 03:50:39,404 - INFO - Update id=485442905 is handled. Duration 182 ms by bot id=8798971690
+2026-03-16 03:50:44,308 - INFO - Update id=485442906 is handled. Duration 140 ms by bot id=8798971690
+2026-03-16 03:50:52,247 - INFO - Update id=485442907 is handled. Duration 164 ms by bot id=8798971690
+2026-03-16 03:51:01,006 - INFO - Update id=485442908 is handled. Duration 168 ms by bot id=8798971690
+2026-03-16 03:51:05,272 - INFO - Update id=485442909 is handled. Duration 150 ms by bot id=8798971690
+2026-03-16 03:51:09,286 - INFO - Rejalashtirilgan postlar boshlandi...
+2026-03-16 03:51:09,287 - INFO - Kanalga post yuborilmoqda: @IEandGS
+2026-03-16 03:51:09,287 - INFO - AFC is enabled with max remote calls: 10.
+2026-03-16 03:51:09,893 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent "HTTP/1.1 400 Bad Request"
+2026-03-16 03:51:09,894 - INFO - Kanalga post yuborilmoqda: @interstudy_journal
+2026-03-16 03:51:09,894 - INFO - AFC is enabled with max remote calls: 10.
+2026-03-16 03:51:10,125 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent "HTTP/1.1 400 Bad Request"
+2026-03-16 03:51:10,368 - INFO - Update id=485442910 is handled. Duration 1279 ms by bot id=8798971690
+2026-03-16 03:53:48,873 - INFO - Update id=485442911 is handled. Duration 179 ms by bot id=8798971690
+2026-03-16 03:53:50,515 - INFO - Polling stopped
+2026-03-16 03:53:50,516 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2026-03-16 03:53:50,516 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8798971690)
+2026-03-16 03:53:50,783 - INFO - Polling stopped for bot @sciencecontent_bot id=8798971690 - 'Content AI'
+2026-03-16 03:53:50,785 - INFO - Bot to'xtatildi.
+2026-03-16 03:53:55,895 - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-03-16 03:53:55,896 - INFO - Added job "scheduled_job" to job store "default"
+2026-03-16 03:53:55,896 - INFO - Scheduler started
+2026-03-16 03:53:55,896 - INFO - Bot ishga tushdi...
+2026-03-16 03:53:55,897 - INFO - Start polling
+2026-03-16 03:53:56,458 - INFO - Run polling for bot @sciencecontent_bot id=8798971690 - 'Content AI'
+2026-03-16 03:53:58,484 - INFO - Update id=485442912 is handled. Duration 473 ms by bot id=8798971690
+2026-03-16 03:54:06,041 - INFO - Update id=485442913 is handled. Duration 231 ms by bot id=8798971690
+2026-03-16 03:54:45,552 - INFO - Update id=485442914 is handled. Duration 309 ms by bot id=8798971690
+2026-03-16 03:54:48,805 - INFO - Update id=485442915 is handled. Duration 251 ms by bot id=8798971690
+2026-03-16 03:54:50,879 - INFO - Rejalashtirilgan postlar boshlandi...
+2026-03-16 03:54:50,880 - INFO - AFC is enabled with max remote calls: 10.
+2026-03-16 03:54:51,611 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent "HTTP/1.1 400 Bad Request"
+2026-03-16 03:54:51,613 - INFO - AFC is enabled with max remote calls: 10.
+2026-03-16 03:54:51,981 - INFO - HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent "HTTP/1.1 400 Bad Request"
+2026-03-16 03:54:52,825 - INFO - Update id=485442916 is handled. Duration 2107 ms by bot id=8798971690
+2026-03-16 03:54:55,414 - INFO - Update id=485442917 is handled. Duration 499 ms by bot id=8798971690
+2026-03-16 03:55:20,994 - INFO - Polling stopped
+2026-03-16 03:55:20,995 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2026-03-16 03:55:20,995 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8798971690)
+2026-03-16 03:55:21,255 - INFO - Polling stopped for bot @sciencecontent_bot id=8798971690 - 'Content AI'
+2026-03-16 03:55:21,256 - INFO - Bot to'xtatildi.
+2026-03-16 03:55:26,303 - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-03-16 03:55:26,305 - INFO - Added job "scheduled_job" to job store "default"
+2026-03-16 03:55:26,305 - INFO - Scheduler started
+2026-03-16 03:55:26,305 - INFO - Bot ishga tushdi...
+2026-03-16 03:55:26,305 - INFO - Start polling
+2026-03-16 03:55:26,783 - INFO - Run polling for bot @sciencecontent_bot id=8798971690 - 'Content AI'
+2026-03-16 03:55:28,389 - INFO - Update id=485442918 is handled. Duration 496 ms by bot id=8798971690
+2026-03-16 03:57:19,885 - INFO - Update id=485442919 is handled. Duration 193 ms by bot id=8798971690
+2026-03-16 06:17:40,436 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientOSError: [WinError 1236] Подключение к сети было разорвано локальной системой
+2026-03-16 06:17:40,440 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8798971690)
+2026-03-16 06:18:02,498 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:18:02,498 - WARNING - Sleep for 1.399034 seconds and try again... (tryings = 1, bot id = 8798971690)
+2026-03-16 06:18:24,948 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:18:24,949 - WARNING - Sleep for 1.825680 seconds and try again... (tryings = 2, bot id = 8798971690)
+2026-03-16 06:18:47,823 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:18:47,823 - WARNING - Sleep for 2.304375 seconds and try again... (tryings = 3, bot id = 8798971690)
+2026-03-16 06:19:11,165 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:19:11,165 - WARNING - Sleep for 2.916369 seconds and try again... (tryings = 4, bot id = 8798971690)
+2026-03-16 06:19:35,116 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:19:35,116 - WARNING - Sleep for 3.733369 seconds and try again... (tryings = 5, bot id = 8798971690)
+2026-03-16 06:19:59,887 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:19:59,887 - WARNING - Sleep for 4.824278 seconds and try again... (tryings = 6, bot id = 8798971690)
+2026-03-16 06:20:25,747 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:20:25,748 - WARNING - Sleep for 5.041186 seconds and try again... (tryings = 7, bot id = 8798971690)
+2026-03-16 06:20:51,862 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:20:51,862 - WARNING - Sleep for 5.079084 seconds and try again... (tryings = 8, bot id = 8798971690)
+2026-03-16 06:21:17,995 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:21:17,995 - WARNING - Sleep for 4.854429 seconds and try again... (tryings = 9, bot id = 8798971690)
+2026-03-16 06:21:43,879 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:21:43,880 - WARNING - Sleep for 5.132430 seconds and try again... (tryings = 10, bot id = 8798971690)
+2026-03-16 06:22:10,065 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:22:10,065 - WARNING - Sleep for 5.152106 seconds and try again... (tryings = 11, bot id = 8798971690)
+2026-03-16 06:22:36,266 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [Превышен таймаут семафора]
+2026-03-16 06:22:36,268 - WARNING - Sleep for 4.996128 seconds and try again... (tryings = 12, bot id = 8798971690)
+2026-03-16 06:22:52,086 - INFO - Connection established (tryings = 13, bot id = 8798971690)
