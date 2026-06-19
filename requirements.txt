@@ -6,3 +6,8 @@ apscheduler
 Pillow
 requests
 psycopg2-binary
+telethon
+httpx
+tzdata
+fastapi
+uvicorn[standard]

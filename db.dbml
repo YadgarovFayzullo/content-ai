@@ -1,0 +1,159 @@
+// Content AI — Database Schema (DBML format)
+// Multi-tenant system: all tables are shared and logically divided by tenant_id
+
+Table tenant_profiles {
+  id int [pk, increment]
+  tenant_id string [unique, not null, note: "UUID hex - stable tenant identifier"]
+  chat_id string [unique, not null, note: "@username or -100..."]
+  owner_id string [null, note: "Telegram user_id of client owner"]
+
+  // Profile configuration
+  channel_name string [default: ""]
+  tone string [default: "neutral"]
+  language string [default: "uz"]
+  writing_style string [default: ""]
+  audience string [default: ""]
+  topics string [default: "", note: "comma-separated topics"]
+
+  // Content settings
+  post_template string [null, note: "Template text for posts"]
+  cta string [default: "", note: "Call-to-action / link"]
+  image_style string [null]
+  avg_post_length int [default: 0, note: "Average post length in chars"]
+
+  // AI parameters
+  creativity_level float [default: 0.5, note: "0.0–1.0 → LLM temperature"]
+  factual_strictness float [default: 0.7, note: "0.0–1.0 → model conservatism"]
+
+  // RAG configuration
+  use_rag boolean [default: true, note: "Use RAG facts in generation"]
+  use_references boolean [default: true, note: "Include reference channels"]
+
+  // Schedule
+  schedule_mode string [default: "off", note: "'off', 'frequency', 'times'"]
+  posts_per_day int [default: 0]
+  post_times string [default: "", note: "HH:MM,HH:MM,... format"]
+
+  // Subscription
+  subscription_tier string [default: "starter", note: "'starter' or 'pro'"]
+  active boolean [default: true]
+
+  // Timestamps
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+
+  indexes {
+    tenant_id
+    chat_id
+    owner_id
+  }
+}
+
+Table tenant_rules {
+  id int [pk, increment]
+  tenant_id string [not null, ref: > tenant_profiles.tenant_id]
+  rule_type string [not null, note: "'forbidden_topic', 'required_hashtag', 'formatting', 'length_limit', 'stylistic'"]
+  rule_value string [not null]
+  is_system boolean [default: false, note: "System-generated rules (hidden from UI)"]
+  created_at datetime [default: `now()`]
+
+  indexes {
+    tenant_id
+  }
+
+  note: "Multiple rules per tenant"
+}
+
+Table posts_history {
+  id int [pk, increment]
+  tenant_id string [not null, ref: > tenant_profiles.tenant_id]
+  topic string [null, note: "Topic/category of the post"]
+  content string [not null, note: "Full post text"]
+  image_path string [null]
+  posted boolean [default: false]
+  message_id int [null, note: "Telegram message_id"]
+  created_at datetime [default: `now()`]
+
+  indexes {
+    tenant_id
+    message_id
+  }
+
+  note: "Memory for uniqueness/deduplication and publishing history"
+}
+
+Table tenant_sources {
+  id int [pk, increment]
+  tenant_id string [not null, ref: > tenant_profiles.tenant_id]
+  source_chat_id string [not null, note: "@username of reference channel"]
+  posts_indexed int [default: 0, note: "Number of posts indexed from this source"]
+  created_at datetime [default: `now()`]
+
+  indexes {
+    tenant_id
+  }
+
+  note: "Reference channels for RAG enrichment (facts/formulations only)"
+}
+
+Table post_metrics {
+  id int [pk, increment]
+  tenant_id string [not null, ref: > tenant_profiles.tenant_id]
+  post_id int [not null, ref: > posts_history.id, note: "posts_history.id"]
+  message_id int [not null]
+
+  // Engagement metrics
+  views int [default: 0]
+  forwards int [default: 0]
+  reactions int [default: 0]
+
+  captured_at datetime [default: `now()`]
+
+  indexes {
+    tenant_id
+    post_id
+  }
+
+  note: "Multiple snapshots per post - tracks growth over time"
+}
+
+
+// ============================================================================
+// RELATIONSHIPS & NOTES
+// ============================================================================
+
+// 1:N: One tenant → Many rules
+// 1:N: One tenant → Many posts
+// 1:N: One tenant → Many sources
+// 1:N: One post → Many metrics (growth snapshots)
+
+note {
+  '''
+  ## Multi-Tenancy
+  - All tables are shared across tenants
+  - Logical isolation via tenant_id filtering
+  - No physical separation (no per-tenant databases/schemas)
+  - ALL queries MUST include `WHERE tenant_id = ?` filter
+
+  ## Key Constraints
+  - tenant_id: unique, indexed (stable identifier)
+  - chat_id: unique, indexed (Telegram @username or numeric ID)
+  - owner_id: nullable (None = managed by super-admin)
+  - message_id: Telegram message identifier for metrics collection
+
+  ## RAG Configuration
+  - use_rag: Enable/disable RAG facts from own posts
+  - use_references: Enable/disable reference channel facts
+  - tenant_sources: List of external channels for enrichment
+
+  ## Scheduling
+  - schedule_mode: "off" (disabled) | "frequency" (N times/day) | "times" (explicit times)
+  - posts_per_day: Used when mode="frequency"
+  - post_times: HH:MM,HH:MM,... format when mode="times"
+
+  ## History & Metrics
+  - posts_history: Published and draft posts (memory for deduplication)
+  - post_metrics: Time-series of engagement (multiple snapshots per post)
+  - captured_at: When metric was measured (for growth analysis)
+  '''
+}

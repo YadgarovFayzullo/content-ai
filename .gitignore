@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 .env
 *.db
@@ -6,3 +7,4 @@ bot.log
 gen_images/
 .idea/
 .vscode/
+.claude/

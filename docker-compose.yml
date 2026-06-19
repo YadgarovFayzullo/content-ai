@@ -2,7 +2,6 @@ services:
   db:
     image: postgres:16-alpine
     container_name: content_ai_db
-    network_mode: host
     restart: always
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
@@ -10,6 +9,10 @@ services:
       POSTGRES_DB: ${DB_NAME:-content_ai}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Bridge + проброс порта: admin-api ходит по имени `db:5432`,
+    # bot (host-режим) — через 127.0.0.1:5432.
+    ports:
+      - "5432:5432"
 
   bot:
     build: .
@@ -24,6 +27,26 @@ services:
     volumes:
       - ./gen_images:/app/gen_images
       - ./bot.log:/app/bot.log
+
+  admin-api:
+    build:
+      context: .
+      dockerfile: admin-api/Dockerfile
+    container_name: content_ai_admin_api
+    restart: always
+    depends_on:
+      - db
+    env_file: .env
+    # Bridge-сеть + проброс порта (как у RAG): доступен с хоста на :8001.
+    # До db ходим по имени сервиса; до RAG (отдельный контейнер, host-режим) —
+    # через host-gateway (работает и на macOS Docker Desktop, и на Linux-VPS).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
+      - RAG_URL=http://host.docker.internal:8000
+    ports:
+      - "8001:8001"
 
 volumes:
   postgres_data:
