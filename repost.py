@@ -158,7 +158,13 @@ async def _attach_image(profile, primary: dict, text: str) -> str:
 
 
 async def _gather_candidates(profile) -> List[dict]:
-    """Скрейп свежих постов всех источников + чистка + точный дедуп."""
+    """Скрейп свежих постов всех источников + чистка + точный дедуп.
+
+    Кандидаты со ВСЕХ источников сортируются по КВОТЕ источника (priority desc),
+    а внутри равного приоритета — по свежести (новейшие первыми), и лишь затем
+    обрезаются до MAX_CANDIDATES. Так посты из приоритетных источников берутся
+    первыми, но при равной квоте свежесть решает, а не порядок БД.
+    """
     sources = await asyncio.to_thread(get_tenant_sources, profile.tenant_id)
     if not sources:
         raise RuntimeError(
@@ -170,11 +176,18 @@ async def _gather_candidates(profile) -> List[dict]:
         posts = await scrape_channel_history(s.source_chat_id, limit=REPOST_FETCH_LIMIT)
         for p in posts:
             p["source_chat_id"] = s.source_chat_id
+            p["priority"] = s.priority
         candidates.extend(posts)
 
     candidates = clean_candidates(candidates)
     seen = await asyncio.to_thread(get_covered_source_keys, profile.tenant_id)
     candidates = [c for c in candidates if _key(c) not in seen]
+
+    # Квота источника превыше всего, затем свежесть: даты Telethon — UTC ISO,
+    # поэтому лексикографической сортировки достаточно; посты без даты — в конец.
+    candidates.sort(
+        key=lambda c: (c.get("priority", 0), c.get("date") or ""), reverse=True
+    )
     return candidates[:MAX_CANDIDATES]
 
 

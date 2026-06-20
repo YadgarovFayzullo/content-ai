@@ -1,8 +1,7 @@
-"""Общие хелперы и FSM-состояния, используемые хендлерами."""
+"""Общие хелперы доступа и безопасной отправки, используемые хендлерами."""
 from typing import List, Optional
 
 from aiogram import types
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, Message
 
 from bot.config import ADMIN_ID
@@ -14,22 +13,6 @@ from database import (
     get_tenants_for_owner,
     is_tenant_owner,
 )
-
-
-class AddChannel(StatesGroup):
-    waiting_for_channel = State()
-
-
-class EditTenant(StatesGroup):
-    entering_value = State()
-    adding_rule_value = State()
-    adding_source_channel = State()
-    entering_frequency = State()
-    entering_times = State()
-
-
-class AssignClient(StatesGroup):
-    waiting_for_user_id = State()
 
 
 def is_super(user: Optional[types.User]) -> bool:

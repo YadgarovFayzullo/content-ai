@@ -149,6 +149,9 @@ class TenantSource(SQLModel, table=True):
     tenant_id: str = Field(index=True)
     source_chat_id: str               # @username стороннего канала
     posts_indexed: int = 0
+    # Квота/приоритет источника: чем БОЛЬШЕ — тем раньше из него берётся новость
+    # в repost-режиме (при равной свежести). 0 — обычный приоритет.
+    priority: int = 0
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -260,6 +263,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "source_message_id": "INTEGER",
     },
     "tenant_rules": {"is_system": "BOOLEAN DEFAULT FALSE"},
+    "tenant_sources": {"priority": "INTEGER DEFAULT 0"},
 }
 
 
@@ -698,12 +702,28 @@ def add_tenant_source(
 
 
 def get_tenant_sources(tenant_id: str) -> List[TenantSource]:
+    """Источники арендатора, отсортированные по приоритету (квоте) — сначала
+    самые приоритетные, при равенстве — старые (по id) первыми."""
     with Session(engine, expire_on_commit=False) as session:
         return list(
             session.exec(
-                select(TenantSource).where(TenantSource.tenant_id == tenant_id)
+                select(TenantSource)
+                .where(TenantSource.tenant_id == tenant_id)
+                .order_by(TenantSource.priority.desc(), TenantSource.id)
             ).all()
         )
+
+
+def set_tenant_source_priority(source_id: int, priority: int) -> bool:
+    """Задаёт квоту/приоритет источнику. Больше — раньше берётся новость."""
+    with Session(engine, expire_on_commit=False) as session:
+        src = session.get(TenantSource, source_id)
+        if not src:
+            return False
+        src.priority = priority
+        session.add(src)
+        session.commit()
+        return True
 
 
 def remove_tenant_source(source_id: int) -> bool:

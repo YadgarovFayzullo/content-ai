@@ -7,9 +7,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram_dialog import setup_dialogs
 
 from bot.config import TOKEN
-from bot.handlers import channels_router, settings_router
+from bot.handlers import channels_router
+from bot.dialogs import (
+    add_channel_dialog,
+    assign_client_dialog,
+    publish_dialog,
+    remove_channel_dialog,
+    channel_admin_entry_router,
+    settings_dialog,
+    settings_entry_router,
+)
 from bot.scheduler import schedule_tick, reindex_references
 from bot.metrics import collect_metrics
 from bot import rag_client
@@ -46,7 +56,16 @@ logging.basicConfig(
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(channels_router)
-dp.include_router(settings_router)
+# aiogram-dialog: точка входа («⚙️ Sozlamalar» / /v2settings) + сам диалог.
+# setup_dialogs ставит мидлвари DialogManager — вызывать после include всех роутеров.
+dp.include_router(settings_entry_router)
+dp.include_router(settings_dialog)
+dp.include_router(channel_admin_entry_router)
+dp.include_router(add_channel_dialog)
+dp.include_router(assign_client_dialog)
+dp.include_router(remove_channel_dialog)
+dp.include_router(publish_dialog)
+setup_dialogs(dp)
 
 
 async def main():
