@@ -8,13 +8,15 @@
 - Правил и расписания
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Depends, Query, Header
+from typing import Optional, List, Tuple
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
+import hashlib
 import sys
 import os
+import time
 import httpx
 
 # Add parent directory to path for imports
@@ -25,10 +27,14 @@ from config import (
     API_VERSION,
     ADMIN_TOKEN,
     ADMIN_ID,
-    TELEGRAM_BOT_TOKEN,
     CORS_CONFIG,
     RAG_URL,
 )
+
+# Токен бота читаем напрямую из окружения (имя переменной в .env —
+# TELEGRAM_BOT_TOKEN; BOT_TOKEN оставлен как запасной вариант). Так не зависим
+# от того, как именно назван токен в config.py конкретного окружения.
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
 from database import (
     get_all_tenants,
     get_tenant_profile,
@@ -57,8 +63,71 @@ async def startup_event():
     """Create database tables if they don't exist."""
     await asyncio.to_thread(create_db_and_tables)
 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Закрыть общий httpx-клиент, если он был открыт."""
+    global _avatar_client
+    if _avatar_client is not None:
+        await _avatar_client.aclose()
+        _avatar_client = None
+
 # Enable CORS
 app.add_middleware(CORSMiddleware, **CORS_CONFIG)
+
+
+# ============================================================================
+# Channel avatars (proxy + cache)
+# ============================================================================
+# Аватарки каналов берутся из Telegram через бота и проксируются клиенту, чтобы
+# BOT_TOKEN не покидал сервер, а временный file_path из getFile не утекал во фронт.
+
+# Telegram Bot API дёргаем напрямую по HTTP через httpx — так не тащим aiogram
+# в образ admin-api. Один общий клиент на процесс (создавать на запрос = дорого).
+_TG_API = "https://api.telegram.org"
+_avatar_client: Optional[httpx.AsyncClient] = None
+
+# chat_id -> (expires_at_epoch, image_bytes | None, etag). None = у канала нет
+# доступного фото (приватный / без аватара) — кешируем, чтобы не дёргать Telegram.
+_avatar_cache: dict[str, Tuple[float, Optional[bytes], str]] = {}
+_AVATAR_TTL_SECONDS = 24 * 60 * 60  # аватарки меняются крайне редко
+
+
+def _get_avatar_client() -> httpx.AsyncClient:
+    global _avatar_client
+    if _avatar_client is None:
+        _avatar_client = httpx.AsyncClient(timeout=10.0)
+    return _avatar_client
+
+
+async def _fetch_avatar_bytes(chat_id: str) -> Tuple[Optional[bytes], str]:
+    """Скачать фото канала через Telegram Bot API. Возвращает (bytes | None, etag)."""
+    if not BOT_TOKEN:
+        return None, ""
+    client = _get_avatar_client()
+    try:
+        r = await client.get(f"{_TG_API}/bot{BOT_TOKEN}/getChat", params={"chat_id": chat_id})
+        r.raise_for_status()
+        photo = (r.json().get("result") or {}).get("photo")
+        file_id = photo.get("big_file_id") if photo else None
+        if not file_id:
+            return None, ""
+
+        rf = await client.get(f"{_TG_API}/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+        rf.raise_for_status()
+        file_path = (rf.json().get("result") or {}).get("file_path")
+        if not file_path:
+            return None, ""
+
+        rb = await client.get(f"{_TG_API}/file/bot{BOT_TOKEN}/{file_path}")
+        rb.raise_for_status()
+        data = rb.content
+    except Exception:
+        return None, ""
+    if not data:
+        return None, ""
+    etag = '"' + hashlib.sha1(data).hexdigest() + '"'
+    return data, etag
 
 
 async def verify_admin(authorization: Optional[str] = Header(None)):
@@ -76,6 +145,28 @@ async def verify_admin(authorization: Optional[str] = Header(None)):
             detail=f"Forbidden: token mismatch. Expected: {ADMIN_TOKEN}, Got: {token}"
         )
     return token
+
+
+async def verify_admin_flexible(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    """Как verify_admin, но допускает токен в query-параметре ?token=.
+
+    Нужно для <img src=...>, который не умеет слать заголовок Authorization.
+    Заголовок имеет приоритет над query.
+    """
+    candidate: Optional[str] = None
+    if authorization and authorization.startswith("Bearer "):
+        candidate = authorization.split(" ", 1)[1].strip()
+    elif token:
+        candidate = token.strip()
+
+    if not candidate:
+        raise HTTPException(status_code=401, detail="Unauthorized: missing token")
+    if candidate != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden: token mismatch")
+    return candidate
 
 
 # ============================================================================
@@ -96,6 +187,7 @@ class TenantProfileSchema(BaseModel):
     use_rag: bool
     use_references: bool
     avg_post_length: Optional[int]
+    content_mode: str = "topic"
     active: bool
     created_at: str
 
@@ -199,6 +291,7 @@ class ProfileUpdateRequest(BaseModel):
     topics: Optional[str] = None
     use_references: Optional[bool] = None
     use_rag: Optional[bool] = None
+    content_mode: Optional[str] = None
     active: Optional[bool] = None
 
 
@@ -247,6 +340,7 @@ async def list_tenants(
             use_rag=t.use_rag,
             use_references=t.use_references,
             avg_post_length=t.avg_post_length,
+            content_mode=getattr(t, "content_mode", None) or "topic",
             active=t.active,
             created_at=t.created_at.isoformat() if t.created_at else None,
         )
@@ -278,8 +372,48 @@ async def get_profile(
         use_rag=profile.use_rag,
         use_references=profile.use_references,
         avg_post_length=profile.avg_post_length,
+        content_mode=getattr(profile, "content_mode", None) or "topic",
         active=profile.active,
         created_at=profile.created_at.isoformat() if profile.created_at else None,
+    )
+
+
+@app.get("/api/admin/tenants/{tenant_id}/avatar", tags=["Tenants"])
+async def get_tenant_avatar(
+    tenant_id: str,
+    request: Request,
+    _: str = Depends(verify_admin_flexible),
+):
+    """Отдать аватарку канала (фото из Telegram), проксируя байты с кешем.
+
+    404 — если канал не найден / у него нет доступного фото; фронт рисует инициалы.
+    """
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    chat_id = profile.chat_id
+    now = time.time()
+    cached = _avatar_cache.get(chat_id)
+    if cached and cached[0] > now:
+        _, data, etag = cached
+    else:
+        data, etag = await _fetch_avatar_bytes(chat_id)
+        _avatar_cache[chat_id] = (now + _AVATAR_TTL_SECONDS, data, etag)
+
+    if not data:
+        raise HTTPException(status_code=404, detail="No avatar")
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "ETag": etag,
+        },
     )
 
 
@@ -420,7 +554,11 @@ async def update_profile(
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     update_data = update.dict(exclude_unset=True)
-    await asyncio.to_thread(update_tenant_profile, tenant_id, update_data)
+    if "content_mode" in update_data and update_data["content_mode"] not in ("topic", "repost"):
+        raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
+    await asyncio.to_thread(
+        lambda: update_tenant_profile(tenant_id, **update_data)
+    )
 
     return {"success": True, "message": "Profile updated"}
 

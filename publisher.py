@@ -15,7 +15,7 @@ from aiogram.types import FSInputFile, Message
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
-from database import save_post
+from database import save_post, save_repost_story
 from orchestrator import GeneratedContent
 
 load_dotenv()
@@ -80,6 +80,15 @@ async def send_to_telegram(
         entry.posted = True
         entry.message_id = message.message_id
         await asyncio.to_thread(save_post, entry)
+
+        # Repost V2: сохраняем «историю» (centroid кластера + ключи всех членов)
+        # для семантического дедупа. Заполнено только в repost-режиме с эмбеддингами.
+        story_vec = content.get("story_vec")
+        story_keys = content.get("story_keys")
+        if story_vec and story_keys:
+            await asyncio.to_thread(
+                save_repost_story, entry.tenant_id, story_vec, story_keys, post_text[:200]
+            )
 
         if ADMIN_ID:
             post_url = (

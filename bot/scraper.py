@@ -28,6 +28,18 @@ def _creds_ready() -> bool:
     return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELETHON_SESSION)
 
 
+def _peer(chat_id: Any) -> Any:
+    """Нормализует chat_id для Telethon.
+
+    Telethon резолвит числовой id канала (-100…) ТОЛЬКО как int; строку «-100…»
+    он трактует как username и не находит (ValueError). @username и прочие строки
+    оставляем как есть."""
+    s = str(chat_id).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    return s
+
+
 async def _get_client() -> TelegramClient:
     global _client
     if _client is None:
@@ -59,7 +71,7 @@ async def scrape_channel_history(
 
     try:
         client = await _get_client()
-        entity = await client.get_entity(chat_id)
+        entity = await client.get_entity(_peer(chat_id))
         posts: list[dict[str, Any]] = []
         async for msg in client.iter_messages(entity, limit=limit):
             text = (msg.message or "").strip()
@@ -81,6 +93,29 @@ async def scrape_channel_history(
         return []
 
 
+_title_cache: dict[str, str] = {}
+
+
+async def get_channel_title(chat_id: str) -> Optional[str]:
+    """Отображаемое имя канала (для кредита «Photo: …» на карточке). Кэшируется на
+    процесс. None — если Telethon не настроен или канал не резолвится."""
+    key = str(chat_id)
+    if key in _title_cache:
+        return _title_cache[key] or None
+    if not _creds_ready():
+        return None
+    try:
+        client = await _get_client()
+        entity = await client.get_entity(_peer(chat_id))
+        title = getattr(entity, "title", None) or getattr(entity, "username", None)
+        _title_cache[key] = title or ""
+        return title
+    except Exception as e:
+        logging.warning(f"Kanal nomini olishda xato ({chat_id}): {e}")
+        _title_cache[key] = ""
+        return None
+
+
 async def download_post_image(
     chat_id: str, message_id: int, out_dir: str = "gen_images"
 ) -> Optional[str]:
@@ -93,7 +128,7 @@ async def download_post_image(
         return None
     try:
         client = await _get_client()
-        entity = await client.get_entity(chat_id)
+        entity = await client.get_entity(_peer(chat_id))
         msg = await client.get_messages(entity, ids=message_id)
         if msg is None or not isinstance(msg.media, MessageMediaPhoto):
             return None

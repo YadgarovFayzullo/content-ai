@@ -32,7 +32,7 @@ def get_assign_pick_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboard
     builder = InlineKeyboardBuilder()
     for t in tenants:
         owner = " 👤" if t.owner_id else ""
-        builder.button(text=f"{t.chat_id}{owner}", callback_data=f"asg:{t.chat_id}")
+        builder.button(text=f"{t.channel_name}{owner}", callback_data=f"asg:{t.chat_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -40,7 +40,7 @@ def get_assign_pick_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboard
 def get_channels_delete_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for t in tenants:
-        builder.button(text=f"❌ {t.chat_id}", callback_data=f"del_{t.chat_id}")
+        builder.button(text=f"❌ {t.channel_name}", callback_data=f"del_{t.chat_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -50,7 +50,7 @@ def get_post_pick_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboardMa
     builder = InlineKeyboardBuilder()
     for t in tenants:
         mark = "🟢" if t.active else "⏸"
-        builder.button(text=f"{mark} {t.chat_id}", callback_data=f"post:{t.chat_id}")
+        builder.button(text=f"{mark} {t.channel_name}", callback_data=f"post:{t.chat_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -60,7 +60,7 @@ def get_preview_pick_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboar
     builder = InlineKeyboardBuilder()
     for t in tenants:
         mark = "🟢" if t.active else "⏸"
-        builder.button(text=f"{mark} {t.chat_id}", callback_data=f"prev:{t.chat_id}")
+        builder.button(text=f"{mark} {t.channel_name}", callback_data=f"prev:{t.chat_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -87,7 +87,7 @@ def get_settings_pick_keyboard(tenants: Sequence[TenantProfile]) -> InlineKeyboa
     builder = InlineKeyboardBuilder()
     for t in tenants:
         mark = "🟢" if t.active else "⏸"
-        builder.button(text=f"{mark} {t.chat_id}", callback_data=f"pick:{t.chat_id}")
+        builder.button(text=f"{mark} {t.channel_name}", callback_data=f"pick:{t.chat_id}")
     builder.adjust(1)
     return builder.as_markup()
 

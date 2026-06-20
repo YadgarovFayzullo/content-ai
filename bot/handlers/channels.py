@@ -220,6 +220,10 @@ async def cb_post_one(callback: types.CallbackQuery, state: FSMContext):
         # же чужая новость репостится снова и снова). В topic-режиме они None.
         pub_source_chat=content["entry"].source_chat_id,
         pub_source_msg=content["entry"].source_message_id,
+        # Story (V2): centroid кластера + ключи членов — для семантического дедупа.
+        # Без проноса publisher не сохранит RepostStory на ручной публикации.
+        pub_story_vec=content.get("story_vec"),
+        pub_story_keys=content.get("story_keys"),
     )
     await reply(
         callback,
@@ -260,6 +264,9 @@ async def cb_publish_confirm(callback: types.CallbackQuery, state: FSMContext, b
         "image_path": data.get("pub_image", ""),
         "entry": entry,
     }
+    if data.get("pub_story_vec") and data.get("pub_story_keys"):
+        content["story_vec"] = data["pub_story_vec"]
+        content["story_keys"] = data["pub_story_keys"]
     ok, detail = await send_to_telegram(bot, content, chat_id)
     await state.clear()
     if ok:

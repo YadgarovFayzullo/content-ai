@@ -28,12 +28,20 @@ _RECENT_TOPICS: dict[str, list[str]] = {}
 _RECENT_GENERATED: dict[str, deque] = {}
 
 
-class GeneratedContent(TypedDict):
-    """Полезная нагрузка, передаваемая в publisher.send_to_telegram."""
+class GeneratedContent(TypedDict, total=False):
+    """Полезная нагрузка, передаваемая в publisher.send_to_telegram.
+
+    text/image_path/entry — обязательны. story_vec/story_keys заполняет только
+    repost-режим V2 (centroid кластера и ключи всех его членов): publisher после
+    успешной публикации сохраняет из них RepostStory для семантического дедупа.
+    В topic-режиме их нет.
+    """
 
     text: str
     image_path: str
     entry: PostHistory
+    story_vec: list[float]
+    story_keys: list[str]
 
 
 def pick_topic(profile: TenantProfile) -> str:

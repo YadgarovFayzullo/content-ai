@@ -9,6 +9,7 @@
 управляет арендаторами — это делает backend (context_builder / orchestrator).
 """
 import json
+import logging
 import os
 import re
 import time
@@ -34,7 +35,7 @@ TEXT_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 # creativity_level: для новостей фактическая точность важнее «креатива», а высокая
 # температура провоцирует домыслы (выдуманные цифры/цитаты/детали сверх источника).
 # Низкое значение держит модель близко к фактам оригинала.
-REPOST_TEMPERATURE = float(os.getenv("REPOST_TEMPERATURE", "0.3"))
+REPOST_TEMPERATURE = float(os.getenv("REPOST_TEMPERATURE", "0.2"))
 
 # Модель ТОЛЬКО для шага переписывания репоста. По умолчанию = TEXT_MODEL (ничего
 # не меняется). Можно указать модель покрупнее (напр. llama-3.3-70b-versatile) —
@@ -420,6 +421,15 @@ WHAT TO DO
 1. Preserve ALL concrete facts: names of companies/products, numbers, dates of
    events that already happened, what was launched/announced. Do NOT invent facts
    that are not in the source. Do NOT drop key facts.
+1a. NUMBERS & NAMED ENTITIES — ZERO FABRICATION. This is the most important rule.
+   - Use ONLY the company names, person names, fund names, amounts, percentages and
+     dates that appear in the source. Never introduce a name or figure the source
+     does not contain.
+   - KEEP every real detail the source DOES give: if the source lists a per-investor
+     breakdown of a round, reproduce it exactly. Only forbidden is INVENTING a
+     breakdown the source never stated — do not split a total into made-up parts.
+   - If a detail (investor, amount, date, participant) is not in the source, simply
+     omit it. Vague-but-true beats specific-but-invented.
 2. Adapt to the channel's `tone`, `writing_style` and `audience`. Restructure into
    a clean Telegram post (hook line + 1–3 short paragraphs + takeaway). Do not copy
    the source's sentence structure verbatim — rewrite it as this channel would.
@@ -537,18 +547,30 @@ def _has_cyrillic(text: str) -> bool:
     return bool(_CYRILLIC_RE.search(text))
 
 
+# В repost-режиме стиль ВСЕГДА сухой и нейтральный (как у новостного канала),
+# независимо от декоративных полей профиля (tone/writing_style/audience). Репост —
+# это переписанная чужая новость: важны факты, а не «энтузиазм»/эмодзи/призывы,
+# которые профиль мог заказать для topic-режима. Дано как явные строки профиля,
+# чтобы движок не подмешивал украшательства и CTA из настроек канала.
+def _repost_profile_lines(profile) -> List[str]:
+    return [
+        "## TENANT PROFILE",
+        "tone: neutral, factual (news wire style)",
+        f"language: {profile.language}",
+        "writing_style: dry and informative — plain sentences, no hype, minimal "
+        "emojis, NO calls to action",
+        "audience: (general)",
+        f"cta: {profile.cta or '(none — no link/contact in post)'}",
+        f"target_length_chars: {profile.avg_post_length or '(unset)'}",
+    ]
+
+
 def _build_repost_user(profile, source_text: str, rules: List[RuleView]) -> str:
     return "\n".join(
         [
             f"## OUTPUT LANGUAGE (translate everything into this): {_language_name(profile.language)}",
             "",
-            "## TENANT PROFILE",
-            f"tone: {profile.tone}",
-            f"language: {profile.language}",
-            f"writing_style: {profile.writing_style or '(unspecified)'}",
-            f"audience: {profile.audience or '(general)'}",
-            f"cta: {profile.cta or '(none — no link/contact in post)'}",
-            f"target_length_chars: {profile.avg_post_length or '(unset)'}",
+            *_repost_profile_lines(profile),
             "",
             "## TENANT RULES",
             _format_rules(rules),
@@ -559,45 +581,215 @@ def _build_repost_user(profile, source_text: str, rules: List[RuleView]) -> str:
     )
 
 
-def _do_rewrite(user: str) -> str:
+def _do_llm(system: str, user: str) -> str:
     text = groq_chat(
-        REPOST_REWRITE_PROMPT, user, temperature=REPOST_TEMPERATURE, model=REPOST_MODEL
+        system, user, temperature=REPOST_TEMPERATURE, model=REPOST_MODEL
     ).strip()
     if not text:
         raise RuntimeError("LLM bo'sh javob qaytardi")
     return text
 
 
-def rewrite_source_post(profile, source_text: str, rules: List[RuleView]) -> str:
-    """Переписывает один чужой пост под стиль/язык канала. Бросает RuntimeError.
+def _generate_with_lang_lock(system: str, base_user: str, language: str) -> str:
+    """Вызов LLM + языковой замок. llama-4-scout порой echo'ит язык источника
+    (русский) или оставляет кириллицу при узбекском выводе. Если целевой язык
+    латинский, а в результате есть кириллица — одна повторная попытка с более
+    жёсткой директивой; берём вариант с меньшей «протечкой». Возвращает HTML."""
+    text = _do_llm(system, base_user)
+    if _target_is_latin(language) and _has_cyrillic(text):
+        stricter = base_user + (
+            "\n\n## STRICT RETRY (your previous output failed the language rule)\n"
+            "The previous attempt contained Cyrillic/Russian text. Rewrite AGAIN, "
+            "ENTIRELY in " + _language_name(language) + ". The result MUST contain "
+            "ZERO Cyrillic letters — transliterate every name and term into Latin."
+        )
+        try:
+            retry = _do_llm(system, stricter)
+            if len(_CYRILLIC_RE.findall(retry)) < len(_CYRILLIC_RE.findall(text)):
+                text = retry
+        except Exception:
+            pass  # сбой повтора — оставляем первый вариант
+    return _md_to_html(_strip_leading_greeting(text))
 
-    Языковой замок: llama-4-scout порой echo'ит язык источника (русский) или
-    оставляет кириллицу при узбекском выводе. Если целевой язык латинский, а в
-    результате есть кириллица — делаем одну повторную попытку с более жёсткой
-    директивой и берём вариант с меньшим числом кириллических символов."""
+
+def rewrite_source_post(profile, source_text: str, rules: List[RuleView]) -> str:
+    """Переписывает ОДИН чужой пост под стиль/язык канала. Бросает RuntimeError."""
     base_user = _build_repost_user(profile, source_text, rules)
     try:
-        text = _do_rewrite(base_user)
-
-        if _target_is_latin(profile.language) and _has_cyrillic(text):
-            stricter = base_user + (
-                "\n\n## STRICT RETRY (your previous output failed the language rule)\n"
-                "The previous attempt contained Cyrillic/Russian text. Rewrite the "
-                "post AGAIN, ENTIRELY in " + _language_name(profile.language) + ". "
-                "The result MUST contain ZERO Cyrillic letters — transliterate every "
-                "name and term into the Latin alphabet."
-            )
-            try:
-                retry = _do_rewrite(stricter)
-                # Берём вариант с меньшей «протечкой» кириллицы (в идеале — без неё).
-                if len(_CYRILLIC_RE.findall(retry)) < len(_CYRILLIC_RE.findall(text)):
-                    text = retry
-            except Exception:
-                pass  # сбой повтора — оставляем первый вариант
-
-        return _md_to_html(_strip_leading_greeting(text))
+        return _generate_with_lang_lock(REPOST_REWRITE_PROMPT, base_user, profile.language)
     except Exception as e:
         raise RuntimeError(f"Postni qayta yozib bo'lmadi: {e}")
+
+
+# Канонизация (V2): несколько сообщений об ОДНОМ событии → один богатый пост.
+CANONICALIZE_PROMPT = """You are a production-grade news rewriting engine for a
+single Telegram channel. You receive SEVERAL source posts (from different channels)
+that all report the SAME real-world event. Produce ONE publishable post for THIS
+channel that MERGES them.
+
+OUTPUT LANGUAGE — HIGHEST PRIORITY, NON-NEGOTIABLE
+- The sources are usually in Russian or English. You MUST FULLY TRANSLATE into the
+  channel's OUTPUT LANGUAGE specified in the user message. Echoing the source
+  language is a FAILURE.
+- If the output language is Uzbek (uz): write 100% in the UZBEK LATIN alphabet.
+  ZERO Cyrillic characters. Transliterate every proper noun and term into Latin
+  ("Тақдимот" → "Taqdimot", "стартап" → "startap"). Correct Uzbek apostrophes
+  (oʻ, gʻ, ʼ).
+
+MERGING (the core task)
+- These posts describe the SAME event. Build a single coherent story.
+- COMBINE complementary facts: if one source gives the amount and another the
+  investors or the date, include all of them — once.
+- DO NOT repeat the same fact multiple times. Deduplicate overlapping statements.
+- If sources CONFLICT on a number/name, prefer the more specific and the one
+  supported by more sources; never average or invent a compromise figure.
+- Preserve ALL concrete facts (companies, products, numbers, dates of past events).
+  Do NOT invent anything absent from every source. Do NOT add facts of your own.
+- NUMBERS & NAMED ENTITIES — ZERO FABRICATION: use only the names/amounts/percentages/
+  dates that appear in at least one source. KEEP every real detail the sources give —
+  if any source lists a per-investor breakdown, reproduce it exactly. Only forbidden
+  is INVENTING data no source states (a made-up investor, figure, or a fabricated
+  split of a total). Omit unknown details rather than inventing them.
+- The result is ONE post about ONE event — never a list of separate news items.
+
+STYLE & RULES
+- Adapt to the channel's tone, writing_style and audience. Clean structure: hook
+  line + 1–3 short paragraphs + takeaway. Match target_length_chars (±30%).
+- Third-party sources: never speak in their first person ("biz", "we", "our");
+  strip their ads, subscription/contact invites, referral/promo links.
+- Do NOT add any link/@mention/CTA unless TENANT PROFILE has a non-empty `cta`
+  (then end with it on a separate paragraph, verbatim). NO dangling link references
+  ("havola orqali", "по ссылке", "register via the link") when there is no real link.
+- Drop greetings and channel/community names. Stay constructive and neutral.
+- Obey every TENANT RULE. Telegram HTML only (<b>,<i>,<u>,<s>,<code>,<a href>),
+  no Markdown. Emojis sparingly (≤4), never as bullets.
+
+OUTPUT
+- Return ONLY the final Telegram post text, fully in the required OUTPUT LANGUAGE.
+  No explanations, no JSON, no metadata."""
+
+
+def _build_canon_user(profile, member_texts: List[str], rules: List[RuleView]) -> str:
+    reports = "\n\n".join(
+        f"--- SOURCE {i + 1} ---\n{t}" for i, t in enumerate(member_texts)
+    )
+    return "\n".join(
+        [
+            f"## OUTPUT LANGUAGE (translate everything into this): {_language_name(profile.language)}",
+            "",
+            *_repost_profile_lines(profile),
+            "",
+            "## TENANT RULES",
+            _format_rules(rules),
+            "",
+            "## SOURCE REPORTS (multiple posts about the SAME event — merge into one)",
+            reports,
+        ]
+    )
+
+
+def canonicalize_cluster(
+    profile, member_texts: List[str], rules: List[RuleView]
+) -> str:
+    """Сводит несколько сообщений об одном событии в один пост. Для кластера из
+    одного поста дешевле и безопаснее обычный rewrite. Бросает RuntimeError."""
+    members = [t for t in member_texts if t and t.strip()]
+    if len(members) <= 1:
+        return rewrite_source_post(profile, members[0] if members else "", rules)
+    base_user = _build_canon_user(profile, members, rules)
+    try:
+        return _generate_with_lang_lock(CANONICALIZE_PROMPT, base_user, profile.language)
+    except Exception as e:
+        raise RuntimeError(f"Klasterni birlashtirib bo'lmadi: {e}")
+
+
+IMAGE_SUBJECT_PROMPT = (
+    "You turn a news post into a SHORT visual subject for an illustration prompt.\n"
+    "Reply with ONLY one concise English noun phrase (5-12 words) capturing the core "
+    "of the news as a VISUAL METAPHOR an artist can draw: the main actor + what "
+    "happens. Output the phrase ALONE.\n"
+    "Strict format:\n"
+    "- Output the phrase and NOTHING else. No preamble, no 'Here is', no explanation, "
+    "no label, no colon, no quotes, no trailing punctuation.\n"
+    "- English only, regardless of the source language.\n"
+    "- Keep concrete, drawable entities (company/product, money, growth, product type).\n"
+    "- Include a key number only if it is the point (e.g. a funding amount).\n"
+    "- Do NOT invent facts; use only what the post states.\n"
+    "Example output: proptech startup raising 150k dollars in venture funding"
+)
+
+# Преамбулы, которые llama иногда добавляет перед ответом, несмотря на инструкцию.
+_SUBJECT_PREAMBLE = re.compile(
+    r"^(here('?s| is)|sure|output|phrase|subject|the phrase)\b.*?:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def image_subject(text: str) -> str:
+    """Короткий английский смысловой subject для картинки (визуальная метафора сути
+    новости), вместо дословно обрезанной первой строки. При сбое LLM — фолбэк на
+    первую строку, обрезанную по границе слова."""
+    plain = re.sub(r"<[^>]+>", " ", text).strip()
+    if not plain:
+        return "startup news"
+    try:
+        raw = groq_chat(IMAGE_SUBJECT_PROMPT, plain[:1500], temperature=0.2)
+        # Берём последнюю содержательную строку, отбросив строки-преамбулы
+        # ("Here is ...:") — реальная фраза обычно идёт после них.
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if not _SUBJECT_PREAMBLE.match(ln)]
+        if lines:
+            out = lines[-1].strip().strip('"\'').rstrip(".").strip()
+            if out and len(out) <= 160:
+                return out
+    except Exception as e:
+        logging.warning(f"image_subject LLM xatosi: {e}")
+    return _subject_fallback(plain)
+
+
+def _subject_fallback(plain: str) -> str:
+    """Первая содержательная строка, обрезанная по ГРАНИЦЕ СЛОВА (≤120 симв.)."""
+    first = next((ln for ln in plain.splitlines() if ln.strip()), plain).strip()
+    if len(first) <= 120:
+        return first or "news"
+    cut = first[:120].rsplit(" ", 1)[0].strip()
+    return cut or first[:120]
+
+
+HEADLINE_PROMPT = (
+    "You write the OVERLAY HEADLINE for a news image card (like a press photo "
+    "caption). You receive a finished Telegram news post. Reply with ONE short, "
+    "punchy headline that captures the news.\n"
+    "Strict rules:\n"
+    "- SAME LANGUAGE as the post — never translate. If the post is in Uzbek Latin, "
+    "stay in Uzbek Latin (zero Cyrillic).\n"
+    "- 4-10 words, max ~70 characters. No final period. No quotes, no hashtags, "
+    "no emojis, no source/channel names, no 'Photo:' label.\n"
+    "- Keep the key actor + what happened (and the key number if it is the point).\n"
+    "- Use ONLY facts from the post; invent nothing.\n"
+    "- Output the headline ALONE — no preamble, no label, no explanation."
+)
+
+
+def news_headline(profile, text: str) -> str:
+    """Короткий заголовок для накладки на картинку — НА ЯЗЫКЕ поста (не перевод).
+    Источник — готовый пост. Фолбэк при сбое LLM — первая строка по границе слова."""
+    plain = re.sub(r"<[^>]+>", " ", text or "")
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if not plain:
+        return ""
+    try:
+        user = f"## OUTPUT LANGUAGE (do NOT translate): {_language_name(profile.language)}\n\n## POST\n{plain[:1800]}"
+        raw = groq_chat(HEADLINE_PROMPT, user, temperature=0.3)
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if not _SUBJECT_PREAMBLE.match(ln)]
+        if lines:
+            out = lines[-1].strip().strip('"\'').rstrip(".").strip()
+            if out and len(out) <= 140:
+                return out
+    except Exception as e:
+        logging.warning(f"news_headline LLM xatosi: {e}")
+    return _subject_fallback(plain)
 
 
 def generate_illustration(ctx: GenerationContext, subject: str) -> str:

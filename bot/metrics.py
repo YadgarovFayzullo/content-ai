@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from database import get_posts_for_metrics, get_tenant_profile, save_metric
-from bot.scraper import _creds_ready, _get_client
+from bot.scraper import _creds_ready, _get_client, _peer
 
 # Окно сбора: посты старше уже стабилизировались, их не переснимаем.
 METRICS_WINDOW_DAYS = 7
@@ -54,7 +54,7 @@ async def collect_metrics() -> int:
                 )
                 continue
 
-            entity = await client.get_entity(profile.chat_id)
+            entity = await client.get_entity(_peer(profile.chat_id))
             msg = await client.get_messages(entity, ids=post.message_id)
             if not msg:
                 skipped += 1

@@ -4,6 +4,7 @@
 (никаких отдельных таблиц на канал). Любой доступ обязан фильтроваться по
 tenant_id — данные арендаторов не должны пересекаться.
 """
+import json
 import os
 import secrets
 import uuid
@@ -167,6 +168,26 @@ class PostMetric(SQLModel, table=True):
     forwards: int = 0
     reactions: int = 0
     captured_at: datetime = Field(default_factory=_utcnow)
+
+
+class RepostStory(SQLModel, table=True):
+    """Опубликованная «история» repost-режима (V2): кластер постов-источников об
+    одном событии, сведённый в один канонический пост.
+
+    Нужна для семантического дедупа: храним усреднённый эмбеддинг кластера
+    (centroid) и ключи ВСЕХ его членов, чтобы не репостить ту же новость снова —
+    ни тем же сообщением, ни перефразированной с другого источника. Вектор хранится
+    как JSON-строка (без pgvector — историй за окно мало, косинус считаем в Python).
+    """
+
+    __tablename__ = "repost_stories"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(index=True)
+    headline: str = ""               # первая строка канонического поста (для логов/дебага)
+    centroid_json: str               # JSON list[float] — усреднённый эмбеддинг кластера
+    member_keys_json: str            # JSON list[str] — "source_chat_id:message_id" членов
+    published_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
 class AuthLogin(SQLModel, table=True):
@@ -564,6 +585,67 @@ def get_reposted_source_keys(tenant_id: str) -> set[str]:
             .where(PostHistory.source_message_id.is_not(None))
         ).all()
         return {f"{chat}:{mid}" for chat, mid in rows if chat and mid is not None}
+
+
+# --- Repost-истории (V2: семантический дедуп/кластеризация) -------------------
+
+
+def save_repost_story(
+    tenant_id: str,
+    centroid: List[float],
+    member_keys: List[str],
+    headline: str = "",
+) -> RepostStory:
+    """Сохраняет опубликованную историю (centroid кластера + ключи всех членов)."""
+    with Session(engine, expire_on_commit=False) as session:
+        story = RepostStory(
+            tenant_id=tenant_id,
+            headline=(headline or "")[:200],
+            centroid_json=json.dumps(centroid),
+            member_keys_json=json.dumps(member_keys),
+        )
+        session.add(story)
+        session.commit()
+        session.refresh(story)
+        return story
+
+
+def get_recent_repost_centroids(tenant_id: str, days: int = 14) -> List[List[float]]:
+    """Центроиды историй, опубликованных за последние `days` дней (для дедупа)."""
+    since = _utcnow() - timedelta(days=days)
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(RepostStory.centroid_json)
+            .where(RepostStory.tenant_id == tenant_id)
+            .where(RepostStory.published_at >= since)
+        ).all()
+    out: List[List[float]] = []
+    for r in rows:
+        try:
+            out.append(json.loads(r))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def get_covered_source_keys(tenant_id: str, days: int = 30) -> set[str]:
+    """Все «закрытые» ключи источников: выбранные посты (PostHistory) + ВСЕ члены
+    опубликованных историй. Так точный дедуп покрывает не только опубликованный
+    пост кластера, но и остальные сообщения о том же событии."""
+    keys = get_reposted_source_keys(tenant_id)
+    since = _utcnow() - timedelta(days=days)
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(RepostStory.member_keys_json)
+            .where(RepostStory.tenant_id == tenant_id)
+            .where(RepostStory.published_at >= since)
+        ).all()
+    for r in rows:
+        try:
+            keys.update(json.loads(r))
+        except (TypeError, ValueError):
+            continue
+    return keys
 
 
 # --- Метрики -----------------------------------------------------------------

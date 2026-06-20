@@ -42,6 +42,28 @@ async def index_posts(
         return 0
 
 
+async def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
+    """Возвращает эмбеддинги для списка текстов (RAG /embed) или None при сбое.
+
+    Используется repost-режимом для семантической кластеризации/дедупа. None —
+    сигнал вызывающему перейти на фолбэк (точный дедуп, без кластеризации), чтобы
+    репост не падал из-за недоступного эмбеддинг-сервиса."""
+    if not texts:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{RAG_URL}/embed", json={"texts": texts})
+            resp.raise_for_status()
+            vectors = resp.json().get("vectors")
+            if not isinstance(vectors, list) or len(vectors) != len(texts):
+                logging.error("RAG /embed: vektorlar soni mos kelmadi")
+                return None
+            return vectors
+    except Exception as e:
+        logging.error(f"RAG /embed xatosi: {e}")
+        return None
+
+
 async def delete_tenant(tenant_id: str) -> bool:
     """Удаляет вектора арендатора из RAG (при удалении канала). True при успехе."""
     try:
