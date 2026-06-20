@@ -7,23 +7,16 @@
 import asyncio
 import html
 
-from aiogram import Bot, Router, types, F
+from aiogram import Router, types, F
 from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
+from aiogram_dialog import DialogManager
 
 from bot.common import (
     is_admin,
     is_super,
     visible_tenants,
-    edit,
-    reply,
 )
-from bot.keyboards import (
-    get_admin_keyboard,
-    get_postall_confirm_keyboard,
-)
-from publisher import send_to_telegram
-from repost import produce_content
+from bot.keyboards import get_admin_keyboard
 from bot.metrics import collect_metrics
 from database import (
     confirm_login_request,
@@ -37,7 +30,9 @@ router = Router()
 @router.message(Command("start"))
 @router.message(F.text == "ℹ️ Yordam")
 async def cmd_start(
-    message: types.Message, state: FSMContext, command: CommandObject = None
+    message: types.Message,
+    dialog_manager: DialogManager,
+    command: CommandObject = None,
 ):
     # Deep-link авторизации в веб-панель: /start auth_<login_token>
     if command and command.args and command.args.startswith("auth_"):
@@ -53,7 +48,9 @@ async def cmd_start(
             "Kanal biriktirilishi uchun shu ID'ni administratorga yuboring."
         )
         return
-    await state.clear()
+    # Сбрасываем активный aiogram-dialog стек (FSMContext.clear() этого не делал) —
+    # /start всегда возвращает пользователя в главное меню из любого диалога.
+    await dialog_manager.reset_stack()
     await message.answer(
         "👋 <b>Boshqaruv paneli</b>\n\n"
         "Kanallarni boshqarish uchun pastdagi tugmalardan foydalaning.",
@@ -109,60 +106,8 @@ async def menu_list(message: types.Message):
     await message.answer("📋 <b>Kanallar:</b>\n\n" + "\n".join(lines))
 
 
-@router.message(F.text == "🚀 Hozir post qilish")
-async def menu_post_now(message: types.Message, state: FSMContext, bot: Bot):
-    if not await asyncio.to_thread(is_admin, message.from_user):
-        return
-    await state.clear()
-    tenants = await asyncio.to_thread(visible_tenants, message.from_user, True)
-    if not tenants:
-        return await message.answer("⚠️ Faol kanallar yo'q. Kanal qo'shing yoki faollashtiring.")
-
-    # Подтверждение перед массовой публикацией (защита от случайного нажатия).
-    names = "\n".join(f"• {html.escape(t.chat_id)}" for t in tenants)
-    await message.answer(
-        f"⚠️ <b>Diqqat:</b> post <b>{len(tenants)} ta faol kanalga</b> "
-        f"darhol joylanadi:\n\n{names}\n\nDavom etamizmi?",
-        reply_markup=get_postall_confirm_keyboard(len(tenants)),
-    )
-
-
-@router.callback_query(F.data == "postallyes")
-async def cb_post_all_confirm(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
-    if not await asyncio.to_thread(is_admin, callback.from_user):
-        return await callback.answer()
-    await callback.answer()
-    tenants = await asyncio.to_thread(visible_tenants, callback.from_user, True)
-    if not tenants:
-        return await edit(callback, "⚠️ Faol kanallar yo'q.")
-
-    await edit(callback, "🚀 <b>Jarayon boshlandi...</b>")
-    lines = []
-    ok_count = 0
-    for profile in tenants:
-        try:
-            content = await produce_content(profile)
-        except Exception as e:
-            lines.append(f"❌ {html.escape(profile.chat_id)}: {html.escape(str(e)[:60])}")
-            continue
-        ok, detail = await send_to_telegram(bot, content, profile.chat_id)
-        ok_count += 1 if ok else 0
-        lines.append(
-            f"✅ {html.escape(profile.chat_id)}" if ok
-            else f"❌ {html.escape(profile.chat_id)}: {html.escape(str(detail)[:60])}"
-        )
-        await asyncio.sleep(3)
-
-    await reply(
-        callback,
-        f"🏁 <b>Yakun:</b> {ok_count}/{len(tenants)} kanalga yuborildi\n\n" + "\n".join(lines)
-    )
-
-
-@router.callback_query(F.data == "postallno")
-async def cb_post_all_cancel(callback: types.CallbackQuery):
-    await callback.answer("Bekor qilindi")
-    await edit(callback, "❌ Bekor qilindi — hech narsa joylanmadi.")
+# «🚀 Hozir post qilish» (подтверждение + массовая публикация) переехало в
+# aiogram-dialog: bot/dialogs/channel_admin.py → PostAllSG / post_all_dialog.
 
 
 @router.message(F.text == "📊 Metrikalarni yig'ish")

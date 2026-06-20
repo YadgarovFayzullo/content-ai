@@ -60,6 +60,15 @@ class PublishSG(StatesGroup):
     confirm = State()
 
 
+class PostAllSG(StatesGroup):
+    """Подтверждение → массовая публикация во ВСЕ активные каналы.
+
+    Заменяет прежний FSM-флоу «🚀 Hozir post qilish» (postallyes/postallno
+    callback-кнопки) из bot/handlers/channels.py.
+    """
+    confirm = State()
+
+
 # --- Добавление канала: одно окно ввода + тяжёлая обработка --------------------
 
 
@@ -467,6 +476,53 @@ async def on_publish_cancel(
     await dialog_manager.done()
 
 
+async def post_all_getter(dialog_manager: DialogManager, **kwargs):
+    user = dialog_manager.event.from_user
+    tenants = await asyncio.to_thread(visible_tenants, user, True)
+    names = "\n".join(f"• {html.escape(t.chat_id)}" for t in tenants)
+    return {"count": len(tenants), "names": names}
+
+
+async def on_post_all_confirm(
+    callback: types.CallbackQuery, widget, dialog_manager: DialogManager
+):
+    """Генерирует и публикует пост в каждый активный канал, шлёт сводку."""
+    if not await asyncio.to_thread(is_admin, callback.from_user):
+        await callback.answer("Ruxsat yo'q")
+        await dialog_manager.done()
+        return
+    tenants = await asyncio.to_thread(visible_tenants, callback.from_user, True)
+    if not tenants:
+        await callback.answer()
+        await callback.message.answer("⚠️ Faol kanallar yo'q.")
+        await dialog_manager.done()
+        return
+
+    await callback.answer()
+    await callback.message.answer("🚀 <b>Jarayon boshlandi...</b>")
+    lines = []
+    ok_count = 0
+    for profile in tenants:
+        try:
+            content = await produce_content(profile)
+        except Exception as e:
+            lines.append(f"❌ {html.escape(profile.chat_id)}: {html.escape(str(e)[:60])}")
+            continue
+        ok, detail = await send_to_telegram(callback.bot, content, profile.chat_id)
+        ok_count += 1 if ok else 0
+        lines.append(
+            f"✅ {html.escape(profile.chat_id)}" if ok
+            else f"❌ {html.escape(profile.chat_id)}: {html.escape(str(detail)[:60])}"
+        )
+        await asyncio.sleep(3)
+
+    await callback.message.answer(
+        f"🏁 <b>Yakun:</b> {ok_count}/{len(tenants)} kanalga yuborildi\n\n"
+        + "\n".join(lines)
+    )
+    await dialog_manager.done()
+
+
 add_channel_dialog = Dialog(
     Window(
         Const(
@@ -573,8 +629,34 @@ publish_dialog = Dialog(
 )
 
 
+post_all_dialog = Dialog(
+    Window(
+        Format(
+            "⚠️ <b>Diqqat:</b> post <b>{count} ta faol kanalga</b> darhol joylanadi:\n\n"
+            "{names}\n\nDavom etamizmi?"
+        ),
+        Button(Format("✅ Ha, {count} kanalga"), id="pa_yes", on_click=on_post_all_confirm),
+        Cancel(Const("❌ Bekor")),
+        state=PostAllSG.confirm,
+        getter=post_all_getter,
+    ),
+)
+
+
 # Точки входа: reply-кнопки admin-меню → запуск соответствующего диалога.
 entry_router = Router()
+
+
+@entry_router.message(F.text == "🚀 Hozir post qilish")
+async def open_post_all_dialog(message: types.Message, dialog_manager: DialogManager):
+    if not await asyncio.to_thread(is_admin, message.from_user):
+        return
+    tenants = await asyncio.to_thread(visible_tenants, message.from_user, True)
+    if not tenants:
+        return await message.answer(
+            "⚠️ Faol kanallar yo'q. Kanal qo'shing yoki faollashtiring."
+        )
+    await dialog_manager.start(PostAllSG.confirm, mode=StartMode.RESET_STACK)
 
 
 @entry_router.message(F.text == "🎯 Bitta kanalga post")

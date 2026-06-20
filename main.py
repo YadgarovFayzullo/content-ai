@@ -15,6 +15,7 @@ from bot.dialogs import (
     add_channel_dialog,
     assign_client_dialog,
     publish_dialog,
+    post_all_dialog,
     remove_channel_dialog,
     channel_admin_entry_router,
     settings_dialog,
@@ -65,6 +66,7 @@ dp.include_router(add_channel_dialog)
 dp.include_router(assign_client_dialog)
 dp.include_router(remove_channel_dialog)
 dp.include_router(publish_dialog)
+dp.include_router(post_all_dialog)
 setup_dialogs(dp)
 
 

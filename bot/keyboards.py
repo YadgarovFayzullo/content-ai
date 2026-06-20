@@ -2,8 +2,8 @@
 import html
 from typing import Sequence
 
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
-from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from database import TenantProfile, TenantRule
 
@@ -23,15 +23,6 @@ def get_admin_keyboard(is_super: bool = False) -> ReplyKeyboardMarkup:
     # 7 общих кнопок + (опц.) назначение + помощь
     builder.adjust(2, 2, 2, 1, 1, 1) if is_super else builder.adjust(2, 2, 2, 1, 1)
     return builder.as_markup(resize_keyboard=True)
-
-
-def get_postall_confirm_keyboard(count: int) -> InlineKeyboardMarkup:
-    """Подтверждение публикации во ВСЕ активные каналы."""
-    builder = InlineKeyboardBuilder()
-    builder.button(text=f"✅ Ha, {count} kanalga", callback_data="postallyes")
-    builder.button(text="❌ Bekor", callback_data="postallno")
-    builder.adjust(2)
-    return builder.as_markup()
 
 
 def render_sources_text(sources) -> str:
