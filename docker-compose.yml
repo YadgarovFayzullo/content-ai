@@ -44,7 +44,9 @@ services:
       - RAG_URL=http://rag-api:8000
     volumes:
       - ./gen_images:/app/gen_images
-      - ./bot.log:/app/bot.log
+    # bot.log НЕ монтируем файлом: на свежем сервере хоста-файла нет, и Docker
+    # создаёт его КАТАЛОГОМ → FileHandler падает с IsADirectoryError. Логи и так
+    # идут в stdout (StreamHandler) и доступны через `docker logs`.
     networks:
       - content_ai_net
 
