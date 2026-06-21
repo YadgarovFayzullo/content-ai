@@ -830,6 +830,40 @@ def image_subject(text: str) -> str:
     return _subject_fallback(plain)
 
 
+TOPIC_STOCK_QUERY_PROMPT = (
+    "You build a SHORT English stock-photo search query for a Telegram post about a "
+    "given TOPIC. The photo must be a WIDE, GENERAL ESTABLISHING shot of the place or "
+    "subject — a recognizable overview: city skyline, cityscape, famous landmark, "
+    "panorama or aerial view. STRICTLY AVOID staged/abstract/lifestyle scenes "
+    "(no person at a window, no hands, no close-ups, no models, no interiors).\n"
+    "Rules:\n"
+    "- Output English only (translate the topic if needed).\n"
+    "- For a city/country: '<Place> city skyline cityscape landmark'.\n"
+    "- 2-6 words, no quotes, no punctuation, no explanation — the query ALONE.\n"
+    "Examples: 'Париж' -> 'Paris city skyline Eiffel Tower'; "
+    "'Tokyo' -> 'Tokyo cityscape skyline'; 'Bali' -> 'Bali landscape aerial view'."
+)
+
+
+def image_subject_for_topic(topic: str) -> str:
+    """Англоязычный запрос к стоку под ТЕМУ поста — общий вид места/достопримечательности
+    (skyline/cityscape/landmark), а не абстрактная сцена. Фолбэк — тема + 'skyline'."""
+    t = (topic or "").strip()
+    if not t:
+        return "city skyline aerial view"
+    try:
+        raw = groq_chat(TOPIC_STOCK_QUERY_PROMPT, t[:200], temperature=0.2)
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if not _SUBJECT_PREAMBLE.match(ln)]
+        if lines:
+            out = lines[-1].strip().strip("\"'`").rstrip(".").strip()
+            if out and len(out) <= 100:
+                return out
+    except Exception as e:
+        logging.warning(f"image_subject_for_topic LLM xatosi: {e}")
+    return f"{t} skyline cityscape landmark"
+
+
 def _subject_fallback(plain: str) -> str:
     """Первая содержательная строка, обрезанная по ГРАНИЦЕ СЛОВА (≤120 симв.)."""
     first = next((ln for ln in plain.splitlines() if ln.strip()), plain).strip()

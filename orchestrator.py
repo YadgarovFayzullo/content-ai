@@ -13,7 +13,7 @@ from typing import TypedDict
 
 from database import TenantProfile, PostHistory, get_tenant_profile
 from context_builder import build_generation_context
-from generator import generate_post, generate_illustration, image_subject
+from generator import generate_post, generate_illustration, image_subject_for_topic
 from image_search import fetch_stock_photo_sync
 
 DEFAULT_TOPIC = "psixologiya, fan yoki texnologiya haqida qiziqarli mini-fakt"
@@ -95,10 +95,10 @@ def generate_for_tenant(profile: TenantProfile) -> GeneratedContent:
     image_mode = (getattr(profile, "image_mode", "ai") or "ai").lower()
     image_path = ""
     if image_mode == "stock":
-        # Визуальный subject (англ.) из текста поста — лучший запрос к Pexels,
-        # чем сырая тема (для «Турции» даст конкретную сцену).
+        # Запрос строим из ТЕМЫ (общий вид места: skyline/cityscape/landmark), а не
+        # из текста поста — иначе получаются абстрактные сцены (человек у окна и т.п.).
         try:
-            subject = image_subject(post_text) or topic
+            subject = image_subject_for_topic(topic)
             found = fetch_stock_photo_sync(subject)
             if found:
                 image_path = found[0]
