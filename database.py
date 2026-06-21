@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List
 
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, Field, create_engine, Session, select
 from dotenv import load_dotenv
 
@@ -221,6 +222,20 @@ class AuthSession(SQLModel, table=True):
     expires_at: datetime
 
 
+class ScheduleSlot(SQLModel, table=True):
+    """Персистентный дедуп автопостинга по расписанию.
+
+    Один ряд = «пост для (канал, дата, время) уже запущен». Уникальный PK `slot`
+    не даёт опубликовать один и тот же запланированный слот дважды — переживает
+    рестарт бота и совпадение тиков. Старые слоты подчищаются раз в сутки.
+    """
+
+    __tablename__ = "schedule_slots"
+
+    slot: str = Field(primary_key=True)  # "YYYY-MM-DD HH:MM <chat_id>"
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 # ---------------------------------------------------------------------------
 # ДВИЖОК БД
 # ---------------------------------------------------------------------------
@@ -284,6 +299,51 @@ def _run_migrations() -> None:
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)  # создаёт недостающие таблицы (вкл. post_metrics)
     _run_migrations()                      # досыпает новые колонки в старые таблицы
+
+
+# ---------------------------------------------------------------------------
+# ДЕДУП АВТОПОСТИНГА ПО РАСПИСАНИЮ
+# ---------------------------------------------------------------------------
+
+
+def claim_schedule_slot(slot: str) -> bool:
+    """Атомарно «застолбить» слот расписания.
+
+    True  — слот наш, можно публиковать.
+    False — слот уже застолблён (дубль) — публиковать НЕ нужно.
+
+    Атомарность держится на уникальном PK: конкурентная вставка того же slot
+    падает с IntegrityError, который мы ловим.
+    """
+    with Session(engine) as session:
+        session.add(ScheduleSlot(slot=slot))
+        try:
+            session.commit()
+            return True
+        except IntegrityError:
+            session.rollback()
+            return False
+
+
+def release_schedule_slot(slot: str) -> None:
+    """Снять отметку слота — при ошибке генерации/отправки, чтобы дать ретрай
+    на следующей минуте."""
+    with Session(engine) as session:
+        obj = session.get(ScheduleSlot, slot)
+        if obj:
+            session.delete(obj)
+            session.commit()
+
+
+def purge_schedule_slots_before(today_prefix: str) -> None:
+    """Удалить слоты прошлых дней (today_prefix = 'YYYY-MM-DD '), чтобы таблица
+    не росла бесконечно."""
+    with Session(engine) as session:
+        rows = session.exec(select(ScheduleSlot)).all()
+        for r in rows:
+            if not r.slot.startswith(today_prefix):
+                session.delete(r)
+        session.commit()
 
 
 # ---------------------------------------------------------------------------

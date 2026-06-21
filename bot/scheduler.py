@@ -21,9 +21,12 @@ from bot.scraper import scrape_channel_history
 from database import (
     TenantProfile,
     add_tenant_source,
+    claim_schedule_slot,
     get_active_tenants,
     get_all_tenants,
     get_tenant_sources,
+    purge_schedule_slots_before,
+    release_schedule_slot,
 )
 from publisher import send_to_telegram
 from repost import produce_content
@@ -72,23 +75,52 @@ def tenant_post_times(profile: TenantProfile) -> List[str]:
     return []
 
 
+async def _publish_due(bot: Bot, profile: TenantProfile, slot: str) -> None:
+    """Сгенерировать и опубликовать один запланированный пост (фоновая задача).
+
+    Вынесено из тика, чтобы тяжёлая генерация (LLM, десятки секунд) не блокировала
+    минутный `schedule_tick` — иначе APScheduler пропускает следующие минуты как
+    misfire, и запланированные посты «теряются». Слот уже застолблён в БД вызывающим;
+    при ошибке снимаем отметку, чтобы дать ретрай на следующей минуте.
+    """
+    try:
+        content = await produce_content(profile)
+    except Exception as e:
+        await asyncio.to_thread(release_schedule_slot, slot)
+        logging.error(f"Jadval generatsiya xatosi ({profile.chat_id}): {e}")
+        return
+    ok, detail = await send_to_telegram(bot, content, profile.chat_id)
+    if not ok:
+        await asyncio.to_thread(release_schedule_slot, slot)
+    logging.info(f"Jadval post ({profile.chat_id}) {slot}: ok={ok} {detail}")
+
+
 async def schedule_tick(bot: Bot) -> None:
-    """Раз в минуту: публикует в каналы, у которых сейчас запланирован пост."""
-    now_hhmm = datetime.now(TZ).strftime("%H:%M")
+    """Раз в минуту: запускает публикацию в каналы, у которых сейчас запланирован
+    пост. Сам тик мгновенный — генерация/отправка уходят в фоновые задачи.
+
+    Дедуп персистентный (таблица schedule_slots): слот «застолбляется» в БД, так
+    что один и тот же (канал, дата, время) не публикуется дважды даже при рестарте
+    бота или совпадении тиков.
+    """
+    now = datetime.now(TZ)
+    now_hhmm = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+    if now_hhmm == "00:00":
+        # Раз в сутки чистим слоты прошлых дней.
+        await asyncio.to_thread(purge_schedule_slots_before, today + " ")
+
     tenants = await asyncio.to_thread(get_active_tenants)
     for profile in tenants:
         if (profile.schedule_mode or "off") == "off":
             continue
         if now_hhmm not in tenant_post_times(profile):
             continue
-        try:
-            content = await produce_content(profile)
-        except Exception as e:
-            logging.error(f"Jadval generatsiya xatosi ({profile.chat_id}): {e}")
-            continue
-        ok, detail = await send_to_telegram(bot, content, profile.chat_id)
-        logging.info(f"Jadval post ({profile.chat_id}) {now_hhmm}: ok={ok} {detail}")
-        await asyncio.sleep(2)
+        slot = f"{today} {now_hhmm} {profile.chat_id}"
+        claimed = await asyncio.to_thread(claim_schedule_slot, slot)
+        if not claimed:
+            continue  # слот уже застолблён — не дублируем
+        asyncio.create_task(_publish_due(bot, profile, slot))
 
 
 async def reindex_references() -> None:

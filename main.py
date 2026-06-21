@@ -74,9 +74,16 @@ setup_dialogs(dp)
 async def main():
     create_db_and_tables()
     set_retriever(_HttpRagRetriever())
-    scheduler = AsyncIOScheduler()
+    # coalesce — схлопывать накопившиеся пропуски в один запуск;
+    # misfire_grace_time — терпеть опоздание старта до 55с (а не дефолтную 1с),
+    # чтобы редкая задержка не выбрасывала минуту целиком;
+    # max_instances — разрешить параллельные тики (сама работа всё равно в фоне).
+    scheduler = AsyncIOScheduler(
+        job_defaults={"coalesce": True, "misfire_grace_time": 55, "max_instances": 5}
+    )
     # Автопостинг по расписанию: минутный тик публикует в каналы, у которых
-    # сейчас запланирован пост (режимы frequency/times per-tenant).
+    # сейчас запланирован пост (режимы frequency/times per-tenant). Тик мгновенный —
+    # генерация уходит в фоновые задачи внутри schedule_tick.
     scheduler.add_job(schedule_tick, "cron", minute="*", args=[bot])
     # Сбор метрик постов дважды в сутки (просмотры/пересылки/реакции через Telethon).
     scheduler.add_job(collect_metrics, "cron", hour="9,21", minute=0)
