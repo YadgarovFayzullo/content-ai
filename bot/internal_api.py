@@ -148,6 +148,9 @@ def create_internal_app(bot: Bot) -> web.Application:
     app.router.add_post(
         "/internal/tenants/{tenant_id}/collect-metrics", handle_collect_metrics
     )
+    # Глобальный сбор метрик (по всем каналам) — как кнопка в боте. collect_metrics()
+    # и так собирает по всем арендаторам, поэтому переиспользуем тот же хэндлер.
+    app.router.add_post("/internal/collect-metrics", handle_collect_metrics)
     return app
 
 

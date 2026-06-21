@@ -1158,6 +1158,15 @@ async def collect_metrics_endpoint(
     )
 
 
+@app.post("/api/admin/collect-metrics", tags=["Metrics"])
+async def collect_metrics_all_endpoint(
+    principal: Principal = Depends(get_principal),
+):
+    """Глобальный сбор метрик по всем каналам — как кнопка в боте. Только супер-админ."""
+    _require_super(principal)
+    return await _proxy_to_bot("POST", "/internal/collect-metrics")
+
+
 # Health check
 @app.get("/api/admin/health")
 async def health():
