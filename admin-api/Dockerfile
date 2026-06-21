@@ -13,6 +13,10 @@ COPY admin-api/config.py .
 # Reuse the shared DB models/access layer from the bot project
 COPY database.py .
 
+# Shared subscription-tier limits (restrict mode) — single source of truth used
+# by both admin-api and the bot.
+COPY tiers.py .
+
 # Generation pipeline (text-only preview for the admin panel). Image generation
 # (google-genai) is imported lazily and not used here, so it isn't installed.
 COPY context_builder.py .

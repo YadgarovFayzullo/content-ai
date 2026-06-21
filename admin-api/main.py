@@ -35,7 +35,17 @@ from config import (
 # TELEGRAM_BOT_TOKEN; BOT_TOKEN оставлен как запасной вариант). Так не зависим
 # от того, как именно назван токен в config.py конкретного окружения.
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+
+# @username бота — нужен, чтобы построить deep-link авторизации клиента в панель
+# (https://t.me/<username>?start=auth_<token>). Если не задан — отдаём только токен.
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
+
+# Внутренний API бота (publish / publish-all / collect-metrics). Бот работает в
+# network_mode: host, поэтому из этого контейнера (bridge) достукиваемся через
+# host-gateway. Общий секрет — ADMIN_TOKEN из .env (заголовок X-Internal-Token).
+INTERNAL_BOT_URL = os.getenv("INTERNAL_BOT_URL", "http://host.docker.internal:8002")
 from database import (
+    TenantProfile,
     get_all_tenants,
     get_tenant_profile,
     get_tenant_rules,
@@ -43,8 +53,13 @@ from database import (
     get_recent_posts,
     get_tenant_stats,
     get_tenants_for_owner,
+    count_tenants_for_owner,
+    get_owner_tiers,
     is_tenant_owner,
+    assign_tenant_owner,
     update_tenant_profile,
+    create_tenant,
+    remove_tenant,
     create_db_and_tables,
     create_login_request,
     get_login_request,
@@ -53,6 +68,17 @@ from database import (
     create_auth_session,
     get_session_owner,
     delete_auth_session,
+)
+from tiers import (
+    TIER_LIMITS,
+    BASIC_ANALYTICS_MAX_DAYS,
+    allows,
+    best_tier,
+    limit_of,
+    limits_for,
+    normalize_tier,
+    required_tier_for,
+    within_limit,
 )
 
 app = FastAPI(title=API_TITLE, version=API_VERSION)
@@ -130,43 +156,109 @@ async def _fetch_avatar_bytes(chat_id: str) -> Tuple[Optional[bytes], str]:
     return data, etag
 
 
-async def verify_admin(authorization: Optional[str] = Header(None)):
-    """Проверить админ-токен."""
+# ============================================================================
+# Аутентификация и доступ (restrict mode)
+# ============================================================================
+# Два типа «принципала» (кто делает запрос):
+#   • супер-админ — статический ADMIN_TOKEN ИЛИ сессия владельца с owner_id==ADMIN_ID.
+#     Видит и меняет ВСЁ, тарифные лимиты на него не распространяются.
+#   • клиент — сессия веб-панели (выдаётся после Telegram-handshake). Видит и меняет
+#     ТОЛЬКО свои каналы (owner_id), и в пределах лимитов тарифа канала (tiers.py).
+# Токен (статический админский или сессионный) передаётся как `Authorization: Bearer`.
+
+
+class Principal:
+    """Кто выполняет запрос: супер-админ (видит всё) или клиент (только свои каналы)."""
+
+    def __init__(self, owner_id: Optional[str], is_super: bool):
+        self.owner_id = owner_id  # Telegram user_id клиента; None — статический супер-токен
+        self.is_super = is_super
+
+
+def _principal_for_token(token: str, owner_id: Optional[str]) -> Principal:
+    """owner_id уже резолвнут из сессии (или None для статического токена)."""
+    is_super = token == ADMIN_TOKEN or (owner_id is not None and owner_id == ADMIN_ID)
+    return Principal(owner_id=None if token == ADMIN_TOKEN else owner_id, is_super=is_super)
+
+
+async def _resolve_principal(candidate: Optional[str]) -> Principal:
+    """Превращает Bearer-токен в Principal: статический супер-токен или сессию клиента."""
+    if not candidate:
+        raise HTTPException(status_code=401, detail="Unauthorized: missing token")
+    if candidate == ADMIN_TOKEN:
+        return Principal(owner_id=None, is_super=True)
+    owner_id = await asyncio.to_thread(get_session_owner, candidate)
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or expired session")
+    return _principal_for_token(candidate, owner_id)
+
+
+async def get_principal(authorization: Optional[str] = Header(None)) -> Principal:
+    """Зависимость авторизации для всех защищённых эндпоинтов."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid Authorization header")
-    try:
-        token = authorization.split(" ")[1].strip()
-    except IndexError:
-        raise HTTPException(status_code=401, detail="Unauthorized: malformed Authorization header")
-
-    if token != ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Forbidden: token mismatch. Expected: {ADMIN_TOKEN}, Got: {token}"
-        )
-    return token
+    return await _resolve_principal(authorization.split(" ", 1)[1].strip())
 
 
-async def verify_admin_flexible(
+async def get_principal_flexible(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
-):
-    """Как verify_admin, но допускает токен в query-параметре ?token=.
-
-    Нужно для <img src=...>, который не умеет слать заголовок Authorization.
-    Заголовок имеет приоритет над query.
+) -> Principal:
+    """Как get_principal, но допускает токен в ?token= (для <img src=...>, который
+    не умеет слать заголовок Authorization). Заголовок имеет приоритет над query.
     """
     candidate: Optional[str] = None
     if authorization and authorization.startswith("Bearer "):
         candidate = authorization.split(" ", 1)[1].strip()
     elif token:
         candidate = token.strip()
+    return await _resolve_principal(candidate)
 
-    if not candidate:
-        raise HTTPException(status_code=401, detail="Unauthorized: missing token")
-    if candidate != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden: token mismatch")
-    return candidate
+
+async def _require_tenant(principal: Principal, tenant_id: str) -> TenantProfile:
+    """Возвращает профиль канала, проверив доступ: 404 если нет, 403 если чужой."""
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not principal.is_super and profile.owner_id != principal.owner_id:
+        raise HTTPException(status_code=403, detail="Forbidden: not your channel")
+    return profile
+
+
+def _require_super(principal: Principal) -> None:
+    """403, если принципал не супер-админ (для глобальных/админских операций)."""
+    if not principal.is_super:
+        raise HTTPException(status_code=403, detail="Forbidden: super-admin only")
+
+
+def _tier_feature_error(feature: str, tier: str) -> None:
+    """403 «фича недоступна на тарифе» со структурой для апселла на фронте."""
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "tier_restricted",
+            "feature": feature,
+            "current_tier": normalize_tier(tier),
+            "required_tier": required_tier_for(feature),
+            "message": f"Feature '{feature}' is not available on the '{normalize_tier(tier)}' plan",
+        },
+    )
+
+
+def _tier_quota_error(limit_key: str, current: int, maximum: int, tier: str) -> None:
+    """403 «квота тарифа исчерпана» со структурой для апселла на фронте."""
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "tier_quota_exceeded",
+            "limit": limit_key,
+            "max": maximum,
+            "current": current,
+            "current_tier": normalize_tier(tier),
+            "required_tier": required_tier_for(limit_key),
+            "message": f"'{limit_key}' limit reached for the '{normalize_tier(tier)}' plan",
+        },
+    )
 
 
 # ============================================================================
@@ -190,6 +282,43 @@ class TenantProfileSchema(BaseModel):
     content_mode: str = "topic"
     active: bool
     created_at: str
+    # Владелец (Telegram user_id) и тариф — для restrict mode. capabilities —
+    # развёрнутые лимиты тарифа (tiers.py), чтобы фронт сразу знал, что показывать.
+    owner_id: Optional[str] = None
+    subscription_tier: str = "starter"
+    schedule_mode: str = "off"
+    posts_per_day: int = 0
+    post_times: str = ""
+    capabilities: dict = {}
+
+
+def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
+    """Собирает TenantProfileSchema из ORM-профиля (одно место — не дублировать)."""
+    tier = normalize_tier(getattr(profile, "subscription_tier", None))
+    return TenantProfileSchema(
+        tenant_id=profile.tenant_id,
+        chat_id=profile.chat_id,
+        channel_name=profile.channel_name or "—",
+        tone=profile.tone,
+        language=profile.language,
+        writing_style=profile.writing_style,
+        audience=profile.audience,
+        topics=profile.topics,
+        creativity_level=profile.creativity_level,
+        factual_strictness=profile.factual_strictness,
+        use_rag=profile.use_rag,
+        use_references=profile.use_references,
+        avg_post_length=profile.avg_post_length,
+        content_mode=getattr(profile, "content_mode", None) or "topic",
+        active=profile.active,
+        created_at=profile.created_at.isoformat() if profile.created_at else None,
+        owner_id=profile.owner_id,
+        subscription_tier=tier,
+        schedule_mode=getattr(profile, "schedule_mode", None) or "off",
+        posts_per_day=getattr(profile, "posts_per_day", 0) or 0,
+        post_times=getattr(profile, "post_times", None) or "",
+        capabilities=limits_for(tier),
+    )
 
 
 class TenantListResponse(BaseModel):
@@ -238,6 +367,9 @@ class SourceSchema(BaseModel):
     id: int
     source_chat_id: str
     posts_indexed: int
+    # Квота/приоритет источника: чем больше — тем раньше из него берётся новость
+    # в repost-режиме (при равной свежести). 0 — обычный приоритет.
+    priority: int
     created_at: str
     last_indexed_at: Optional[str] = None
 
@@ -293,16 +425,26 @@ class ProfileUpdateRequest(BaseModel):
     use_rag: Optional[bool] = None
     content_mode: Optional[str] = None
     active: Optional[bool] = None
+    # Авто-расписание (гейтится тарифом: scheduling + max_posts_per_day).
+    schedule_mode: Optional[str] = None  # "off" | "frequency" | "times"
+    posts_per_day: Optional[int] = None
+    post_times: Optional[str] = None
 
 
 class SourceAddRequest(BaseModel):
     source_chat_id: str
+    # Необязательная квота при добавлении (больше — раньше берётся новость).
+    priority: int = 0
 
 
 class SourceAddResponse(BaseModel):
     success: bool
     source_id: int
     posts_indexed: int
+
+
+class SourcePriorityRequest(BaseModel):
+    priority: int
 
 
 class GenerateRequest(BaseModel):
@@ -315,82 +457,132 @@ class GenerateResponse(BaseModel):
     topic: str
 
 
+class TenantCreateRequest(BaseModel):
+    chat_id: str
+    channel_name: Optional[str] = None
+    language: Optional[str] = None
+    tone: Optional[str] = None
+    topics: Optional[str] = None
+    content_mode: Optional[str] = None
+    # Только супер-админ: назначить владельца и тариф при создании. У клиента эти
+    # поля игнорируются (owner_id = он сам, tier = его «лучший» текущий тариф).
+    owner_id: Optional[str] = None
+    subscription_tier: Optional[str] = None
+
+
+class PublishRequest(BaseModel):
+    text: Optional[str] = None
+    topic: Optional[str] = None
+    context: Optional[str] = None
+
+
+class TierUpdateRequest(BaseModel):
+    subscription_tier: str  # starter | pro | premium
+
+
+class OwnerAssignRequest(BaseModel):
+    owner_id: Optional[str] = None  # None — снять владельца (станет «ничей»)
+
+
 # ============================================================================
 # Endpoints
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# Авторизация клиента в веб-панель (Telegram deep-link handshake) + текущий юзер
+# ----------------------------------------------------------------------------
+
+@app.post("/api/admin/auth/telegram/start", tags=["Auth"])
+async def auth_telegram_start():
+    """Начать вход: создаём одноразовый login-токен и deep-link на бота.
+
+    Фронт открывает deep_link (или показывает QR), пользователь жмёт Start в боте —
+    тот подтверждает токен. Затем фронт поллит /auth/telegram/poll.
+    """
+    login = await asyncio.to_thread(create_login_request)
+    deep_link = (
+        f"https://t.me/{BOT_USERNAME}?start=auth_{login.token}" if BOT_USERNAME else None
+    )
+    return {"token": login.token, "deep_link": deep_link, "expires_in": 300}
+
+
+@app.get("/api/admin/auth/telegram/poll", tags=["Auth"])
+async def auth_telegram_poll(token: str = Query(...)):
+    """Опрос статуса login-токена. confirmed → выдаём сессию (одноразово)."""
+    login = await asyncio.to_thread(get_login_request, token)
+    if not login:
+        raise HTTPException(status_code=404, detail="login token not found")
+    if login.status == "pending":
+        return {"status": "pending"}
+    if login.status == "denied":
+        raise HTTPException(status_code=403, detail={"status": "denied"})
+    if login.status == "consumed":
+        raise HTTPException(status_code=409, detail={"status": "consumed"})
+
+    owner_id = login.telegram_user_id or ""
+    session_token = await asyncio.to_thread(create_auth_session, owner_id)
+    await asyncio.to_thread(mark_login_consumed, token)
+    return {
+        "status": "confirmed",
+        "session_token": session_token,
+        "owner_id": owner_id,
+        "is_super": owner_id == ADMIN_ID,
+    }
+
+
+@app.post("/api/admin/auth/logout", tags=["Auth"])
+async def auth_logout(authorization: Optional[str] = Header(None)):
+    """Завершить сессию (удаляет сессионный токен; статический супер-токен игнорим)."""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        if token != ADMIN_TOKEN:
+            await asyncio.to_thread(delete_auth_session, token)
+    return {"success": True}
+
+
+@app.get("/api/admin/me", tags=["Auth"])
+async def get_me(principal: Principal = Depends(get_principal)):
+    """Кто я: роль, владелец и полная матрица тарифов (для рендера ограничений)."""
+    return {
+        "owner_id": principal.owner_id,
+        "is_super": principal.is_super,
+        "tiers": TIER_LIMITS,
+    }
+
+
 @app.get("/api/admin/tenants", response_model=TenantListResponse, tags=["Tenants"])
 async def list_tenants(
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> TenantListResponse:
-    """Получить список всех каналов."""
-    tenants = await asyncio.to_thread(get_all_tenants)
-    result = [
-        TenantProfileSchema(
-            tenant_id=t.tenant_id,
-            chat_id=t.chat_id,
-            channel_name=t.channel_name or "—",
-            tone=t.tone,
-            language=t.language,
-            writing_style=t.writing_style,
-            audience=t.audience,
-            topics=t.topics,
-            creativity_level=t.creativity_level,
-            factual_strictness=t.factual_strictness,
-            use_rag=t.use_rag,
-            use_references=t.use_references,
-            avg_post_length=t.avg_post_length,
-            content_mode=getattr(t, "content_mode", None) or "topic",
-            active=t.active,
-            created_at=t.created_at.isoformat() if t.created_at else None,
-        )
-        for t in tenants
-    ]
-    return TenantListResponse(tenants=result)
+    """Список каналов: супер-админ — все, клиент — только свои (restrict)."""
+    if principal.is_super:
+        tenants = await asyncio.to_thread(get_all_tenants)
+    else:
+        tenants = await asyncio.to_thread(get_tenants_for_owner, principal.owner_id)
+    return TenantListResponse(tenants=[_tenant_schema(t) for t in tenants])
 
 
 @app.get("/api/admin/tenants/{tenant_id}/profile", response_model=TenantProfileSchema, tags=["Tenants"])
 async def get_profile(
     tenant_id: str,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> TenantProfileSchema:
-    """Получить полный профиль канала."""
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-    return TenantProfileSchema(
-        tenant_id=profile.tenant_id,
-        chat_id=profile.chat_id,
-        channel_name=profile.channel_name or "—",
-        tone=profile.tone,
-        language=profile.language,
-        writing_style=profile.writing_style,
-        audience=profile.audience,
-        topics=profile.topics,
-        creativity_level=profile.creativity_level,
-        factual_strictness=profile.factual_strictness,
-        use_rag=profile.use_rag,
-        use_references=profile.use_references,
-        avg_post_length=profile.avg_post_length,
-        content_mode=getattr(profile, "content_mode", None) or "topic",
-        active=profile.active,
-        created_at=profile.created_at.isoformat() if profile.created_at else None,
-    )
+    """Получить полный профиль канала (только свой/любой для супера)."""
+    profile = await _require_tenant(principal, tenant_id)
+    return _tenant_schema(profile)
 
 
 @app.get("/api/admin/tenants/{tenant_id}/avatar", tags=["Tenants"])
 async def get_tenant_avatar(
     tenant_id: str,
     request: Request,
-    _: str = Depends(verify_admin_flexible),
+    principal: Principal = Depends(get_principal_flexible),
 ):
     """Отдать аватарку канала (фото из Telegram), проксируя байты с кешем.
 
     404 — если канал не найден / у него нет доступного фото; фронт рисует инициалы.
     """
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    profile = await _require_tenant(principal, tenant_id)
 
     chat_id = profile.chat_id
     now = time.time()
@@ -422,10 +614,26 @@ async def get_stats(
     tenant_id: str,
     days: int = Query(30, ge=1, le=365),
     limit: int = Query(20, ge=1, le=100),
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ):
-    """Получить метрики постов за период из post_metrics / posts_history."""
-    return await asyncio.to_thread(get_tenant_stats, tenant_id, days, limit)
+    """Получить метрики постов за период из post_metrics / posts_history.
+
+    На тарифах с базовой аналитикой (starter) окно ограничено BASIC_ANALYTICS_MAX_DAYS
+    и не отдаётся разбивка по темам — это и есть restrict «basic analytics».
+    """
+    profile = await _require_tenant(principal, tenant_id)
+    basic = (
+        not principal.is_super
+        and limits_for(profile.subscription_tier)["analytics"] == "basic"
+    )
+    if basic:
+        days = min(days, BASIC_ANALYTICS_MAX_DAYS)
+    stats = await asyncio.to_thread(get_tenant_stats, tenant_id, days, limit)
+    if basic and isinstance(stats, dict):
+        stats["by_topic"] = []
+        stats["analytics_tier"] = "basic"
+        stats["window_days"] = days
+    return stats
 
 
 @app.get("/api/admin/tenants/{tenant_id}/posts", response_model=PostsListResponse, tags=["Posts"])
@@ -434,9 +642,10 @@ async def get_posts(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     topic: Optional[str] = None,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> PostsListResponse:
     """Получить историю опубликованных постов."""
+    await _require_tenant(principal, tenant_id)
     posts = await asyncio.to_thread(get_recent_posts, tenant_id, limit * 2)
     if not posts:
         return PostsListResponse(total=0, posts=[])
@@ -460,9 +669,10 @@ async def get_posts(
 @app.get("/api/admin/tenants/{tenant_id}/sources", response_model=SourcesListResponse, tags=["Sources"])
 async def get_sources(
     tenant_id: str,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> SourcesListResponse:
     """Получить список источников (reference channels)."""
+    await _require_tenant(principal, tenant_id)
     sources = await asyncio.to_thread(get_tenant_sources, tenant_id)
     if not sources:
         return SourcesListResponse(sources=[])
@@ -472,6 +682,7 @@ async def get_sources(
             id=s.id,
             source_chat_id=s.source_chat_id,
             posts_indexed=s.posts_indexed,
+            priority=s.priority,
             created_at=s.created_at.isoformat() if s.created_at else None,
         )
         for s in sources
@@ -482,9 +693,10 @@ async def get_sources(
 @app.get("/api/admin/tenants/{tenant_id}/rules", response_model=RulesListResponse, tags=["Rules"])
 async def get_rules(
     tenant_id: str,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> RulesListResponse:
     """Получить все правила канала."""
+    await _require_tenant(principal, tenant_id)
     rules = await asyncio.to_thread(get_tenant_rules, tenant_id, False)
     if not rules:
         return RulesListResponse(rules=[])
@@ -518,10 +730,10 @@ def _probe_rag_ready() -> str:
 @app.get("/api/admin/tenants/{tenant_id}/rag-status", response_model=RAGStatusResponse, tags=["RAG"])
 async def get_rag_status(
     tenant_id: str,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> RAGStatusResponse:
     """Получить статус RAG и индексирования."""
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    profile = await _require_tenant(principal, tenant_id)
     sources = await asyncio.to_thread(get_tenant_sources, tenant_id)
 
     total_indexed = sum(s.posts_indexed for s in sources) if sources else 0
@@ -542,20 +754,48 @@ async def get_rag_status(
     )
 
 
+def _enforce_profile_tier(principal: Principal, tier: str, data: dict) -> None:
+    """Проверяет, что запрошенные изменения профиля разрешены тарифом (для клиента).
+
+    Супер-админ не ограничен. Гейтятся: RAG (use_rag/use_references), repost-режим,
+    авто-расписание и его частота (max_posts_per_day).
+    """
+    if principal.is_super:
+        return
+    if data.get("use_rag") or data.get("use_references"):
+        if not allows(tier, "rag"):
+            _tier_feature_error("rag", tier)
+    if data.get("content_mode") == "repost" and not allows(tier, "repost_mode"):
+        _tier_feature_error("repost_mode", tier)
+    if data.get("schedule_mode") and data["schedule_mode"] != "off":
+        if not allows(tier, "scheduling"):
+            _tier_feature_error("scheduling", tier)
+    ppd = data.get("posts_per_day")
+    if ppd is not None and ppd > 0:
+        if not allows(tier, "scheduling"):
+            _tier_feature_error("scheduling", tier)
+        maxp = limit_of(tier, "max_posts_per_day")
+        if not within_limit(ppd, maxp):
+            _tier_quota_error("max_posts_per_day", ppd, maxp, tier)
+
+
 @app.patch("/api/admin/tenants/{tenant_id}/profile", tags=["Tenants"])
 async def update_profile(
     tenant_id: str,
     update: ProfileUpdateRequest,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ):
-    """Обновить профиль канала."""
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    """Обновить профиль канала (в пределах тарифа канала, см. _enforce_profile_tier)."""
+    profile = await _require_tenant(principal, tenant_id)
 
     update_data = update.dict(exclude_unset=True)
     if "content_mode" in update_data and update_data["content_mode"] not in ("topic", "repost"):
         raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
+    if "schedule_mode" in update_data and update_data["schedule_mode"] not in ("off", "frequency", "times"):
+        raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency' or 'times'")
+
+    _enforce_profile_tier(principal, profile.subscription_tier, update_data)
+
     await asyncio.to_thread(
         lambda: update_tenant_profile(tenant_id, **update_data)
     )
@@ -567,14 +807,12 @@ async def update_profile(
 async def generate_post_preview(
     tenant_id: str,
     req: GenerateRequest,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> GenerateResponse:
     """Сгенерировать ТЕКСТ поста под стиль канала (превью). Не публикует."""
     from orchestrator import generate_preview
 
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    await _require_tenant(principal, tenant_id)
 
     try:
         result = await asyncio.to_thread(
@@ -590,19 +828,33 @@ async def generate_post_preview(
 async def add_source(
     tenant_id: str,
     req: SourceAddRequest,
-    token: str = Depends(verify_admin),
+    principal: Principal = Depends(get_principal),
 ) -> SourceAddResponse:
-    """Добавить новый источник (индексирование происходит в фоне)."""
-    from database import add_tenant_source
+    """Добавить новый источник (индексирование происходит в фоне).
 
-    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    Число источников на канал ограничено тарифом (max_sources). Уже добавленный
+    источник (по source_chat_id) не считается новым — апсерт под квоту не подпадает.
+    """
+    from database import add_tenant_source, set_tenant_source_priority
+
+    profile = await _require_tenant(principal, tenant_id)
+
+    existing = await asyncio.to_thread(get_tenant_sources, tenant_id)
+    already = any(s.source_chat_id == req.source_chat_id for s in existing)
+    if not principal.is_super and not already:
+        maxs = limit_of(profile.subscription_tier, "max_sources")
+        if not within_limit(len(existing) + 1, maxs):
+            _tier_quota_error("max_sources", len(existing), maxs, profile.subscription_tier)
 
     # Сохраняем источник в БД
     source = await asyncio.to_thread(
         add_tenant_source, tenant_id, req.source_chat_id, 0
     )
+
+    # Квота задаётся отдельно (add_tenant_source её не принимает) — только если
+    # запросили ненулевой приоритет, чтобы не трогать дефолт без нужды.
+    if req.priority and source.id:
+        await asyncio.to_thread(set_tenant_source_priority, source.id, req.priority)
 
     # TODO: Запустить фоновую задачу на индексирование через Celery/APScheduler
 
@@ -610,6 +862,218 @@ async def add_source(
         success=True,
         source_id=source.id or 0,
         posts_indexed=0,  # Будет обновлено после индексирования
+    )
+
+
+@app.patch("/api/admin/tenants/{tenant_id}/sources/{source_id}/priority", tags=["Sources"])
+async def update_source_priority(
+    tenant_id: str,
+    source_id: int,
+    req: SourcePriorityRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Задать квоту/приоритет источнику (больше — раньше берётся новость)."""
+    from database import set_tenant_source_priority
+
+    await _require_tenant(principal, tenant_id)
+    # Проверяем, что источник действительно принадлежит этому каналу — иначе
+    # по source_id можно было бы менять чужие источники.
+    sources = await asyncio.to_thread(get_tenant_sources, tenant_id)
+    if not any(s.id == source_id for s in sources):
+        raise HTTPException(status_code=404, detail="Source not found for this tenant")
+
+    ok = await asyncio.to_thread(set_tenant_source_priority, source_id, req.priority)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"success": True, "priority": req.priority}
+
+
+@app.delete("/api/admin/tenants/{tenant_id}/sources/{source_id}", tags=["Sources"])
+async def delete_source(
+    tenant_id: str,
+    source_id: int,
+    principal: Principal = Depends(get_principal),
+):
+    """Удалить источник (reference channel) из канала."""
+    from database import remove_tenant_source
+
+    await _require_tenant(principal, tenant_id)
+    sources = await asyncio.to_thread(get_tenant_sources, tenant_id)
+    if not any(s.id == source_id for s in sources):
+        raise HTTPException(status_code=404, detail="Source not found for this tenant")
+
+    ok = await asyncio.to_thread(remove_tenant_source, source_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"success": True, "message": "Source removed"}
+
+
+async def _proxy_to_bot(method: str, path: str, json_body: Optional[dict] = None) -> dict:
+    """Делегирует action-запрос внутреннему API бота (единственный владелец
+    aiogram-Bot и Telethon). Публикация/генерация может идти долго — таймаут щедрый.
+    """
+    url = f"{INTERNAL_BOT_URL}{path}"
+    headers = {"X-Internal-Token": ADMIN_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            r = await client.request(method, url, json=json_body, headers=headers)
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Bot internal API unreachable: {e}",
+        )
+    if r.status_code >= 400:
+        # Пробрасываем тело ошибки бота как есть (там осмысленный message).
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    return r.json()
+
+
+@app.post("/api/admin/tenants", tags=["Tenants"])
+async def create_tenant_endpoint(
+    req: TenantCreateRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Создать канал (профиль). Возвращает 409, если он уже есть.
+
+    Клиент: владельцем становится он сам, тариф = его «лучший» текущий, и действует
+    квота max_channels (по этому тарифу). Супер-админ: может задать owner_id и тариф.
+    """
+    # Юзернеймы в Telegram регистронезависимы — нормализуем, как делает бот, чтобы
+    # @Chan и @chan не порождали дубль (chat_id уникален и регистрозависим в БД).
+    chat_id = req.chat_id.strip()
+    if chat_id.startswith("@"):
+        chat_id = chat_id.lower()
+
+    fields = req.dict(exclude_unset=True, exclude={"chat_id", "owner_id", "subscription_tier"})
+    if "content_mode" in fields and fields["content_mode"] not in ("topic", "repost"):
+        raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
+
+    if principal.is_super:
+        # Супер задаёт владельца и тариф явно (или дефолты).
+        if req.owner_id is not None:
+            fields["owner_id"] = req.owner_id
+        fields["subscription_tier"] = normalize_tier(req.subscription_tier)
+    else:
+        # Клиент: владелец = он сам; тариф наследуется от лучшего из его каналов
+        # (новые каналы того же уровня), но не выше квоты на число каналов.
+        owner_id = principal.owner_id
+        owner_tiers = await asyncio.to_thread(get_owner_tiers, owner_id)
+        owner_tier = best_tier(owner_tiers)
+        count = await asyncio.to_thread(count_tenants_for_owner, owner_id)
+        maxc = limit_of(owner_tier, "max_channels")
+        if not within_limit(count + 1, maxc):
+            _tier_quota_error("max_channels", count, maxc, owner_tier)
+        if fields.get("content_mode") == "repost" and not allows(owner_tier, "repost_mode"):
+            _tier_feature_error("repost_mode", owner_tier)
+        fields["owner_id"] = owner_id
+        fields["subscription_tier"] = owner_tier
+
+    profile = await asyncio.to_thread(create_tenant, chat_id, **fields)
+    if not profile:
+        raise HTTPException(status_code=409, detail="Tenant already exists")
+
+    return {"success": True, "tenant": _tenant_schema(profile)}
+
+
+@app.patch("/api/admin/tenants/{tenant_id}/tier", tags=["Tenants"])
+async def update_tenant_tier(
+    tenant_id: str,
+    req: TierUpdateRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Сменить тариф канала. Только супер-админ (это биллинговое решение)."""
+    _require_super(principal)
+    if req.subscription_tier not in TIER_LIMITS:
+        raise HTTPException(status_code=422, detail=f"tier must be one of {list(TIER_LIMITS)}")
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    updated = await asyncio.to_thread(
+        lambda: update_tenant_profile(tenant_id, subscription_tier=req.subscription_tier)
+    )
+    return {"success": True, "tenant": _tenant_schema(updated)}
+
+
+@app.patch("/api/admin/tenants/{tenant_id}/owner", tags=["Tenants"])
+async def assign_owner(
+    tenant_id: str,
+    req: OwnerAssignRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Назначить/снять владельца канала (привязка к клиенту). Только супер-админ."""
+    _require_super(principal)
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    updated = await asyncio.to_thread(assign_tenant_owner, tenant_id, req.owner_id)
+    return {"success": True, "tenant": _tenant_schema(updated)}
+
+
+@app.delete("/api/admin/tenants/{tenant_id}", tags=["Tenants"])
+async def delete_tenant_endpoint(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Удалить канал (профиль + его RAG-индекс). Клиент — только свой."""
+    profile = await _require_tenant(principal, tenant_id)
+
+    removed = await asyncio.to_thread(remove_tenant, profile.chat_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Чистим RAG-индекс канала (иначе осиротевшие вектора) — best-effort, как в боте.
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(f"{RAG_URL}/delete", json={"tenant_id": tenant_id})
+    except Exception:
+        pass
+
+    return {"success": True}
+
+
+@app.post("/api/admin/tenants/{tenant_id}/publish", tags=["Publish"])
+async def publish_endpoint(
+    tenant_id: str,
+    req: PublishRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Опубликовать пост в канал. Делегируется внутреннему API бота.
+
+    Картинки к посту генерятся только если тариф канала это разрешает
+    (image_generation) — иначе боту передаём allow_image=false, и он постит без фото.
+    """
+    profile = await _require_tenant(principal, tenant_id)
+    body = req.dict(exclude_unset=True)
+    body["allow_image"] = principal.is_super or allows(
+        profile.subscription_tier, "image_generation"
+    )
+    return await _proxy_to_bot(
+        "POST", f"/internal/tenants/{tenant_id}/publish", body
+    )
+
+
+@app.post("/api/admin/publish-all", tags=["Publish"])
+async def publish_all_endpoint(
+    principal: Principal = Depends(get_principal),
+):
+    """Опубликовать во все активные каналы. Только супер-админ (глобальная операция)."""
+    _require_super(principal)
+    return await _proxy_to_bot("POST", "/internal/publish-all")
+
+
+@app.post("/api/admin/tenants/{tenant_id}/collect-metrics", tags=["Metrics"])
+async def collect_metrics_endpoint(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Запустить сбор метрик (Telethon у бота). Делегируется внутреннему API бота."""
+    await _require_tenant(principal, tenant_id)
+    return await _proxy_to_bot(
+        "POST", f"/internal/tenants/{tenant_id}/collect-metrics"
     )
 
 

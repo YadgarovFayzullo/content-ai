@@ -27,6 +27,7 @@ from database import (
 )
 from publisher import send_to_telegram
 from repost import produce_content
+from tiers import allows, is_unlimited, limit_of
 
 # Часовой пояс расписания (по умолчанию Ташкент). Fallback на UTC+5, если в образе
 # нет базы tzdata.
@@ -41,11 +42,21 @@ POST_WINDOW_END = 21 * 60
 
 
 def tenant_post_times(profile: TenantProfile) -> List[str]:
-    """Список времён "HH:MM", когда канал должен постить сегодня."""
+    """Список времён "HH:MM", когда канал должен постить сегодня.
+
+    Уважает тариф (tiers.py): авто-расписание только на тарифах со `scheduling`,
+    а частота в режиме frequency ограничена потолком `max_posts_per_day`.
+    """
+    tier = getattr(profile, "subscription_tier", None)
+    if not allows(tier, "scheduling"):
+        return []
+
     mode = profile.schedule_mode or "off"
 
     if mode == "frequency" and profile.posts_per_day > 0:
-        n = min(profile.posts_per_day, 24)
+        max_ppd = limit_of(tier, "max_posts_per_day")
+        ppd = profile.posts_per_day if is_unlimited(max_ppd) else min(profile.posts_per_day, max_ppd)
+        n = min(ppd, 24)
         if n == 1:
             mins = [(POST_WINDOW_START + POST_WINDOW_END) // 2]
         else:
@@ -54,7 +65,9 @@ def tenant_post_times(profile: TenantProfile) -> List[str]:
         return [f"{m // 60:02d}:{m % 60:02d}" for m in mins]
 
     if mode == "times" and profile.post_times:
-        return [t.strip() for t in profile.post_times.split(",") if t.strip()]
+        times = [t.strip() for t in profile.post_times.split(",") if t.strip()]
+        max_ppd = limit_of(tier, "max_posts_per_day")
+        return times if is_unlimited(max_ppd) else times[:max_ppd]
 
     return []
 

@@ -18,6 +18,7 @@ from database import (
     get_top_posts,
 )
 from rag import get_retriever
+from tiers import allows
 
 
 @dataclass
@@ -70,12 +71,18 @@ def build_generation_context(
     #   use_references — подмешивать факты из РЕФЕРЕНС-каналов
     # Раньше рефералки гейтились через use_rag, и при выключенном RAG они молчали,
     # даже будучи включёнными. Теперь каждый источник управляется своим флагом.
-    if profile.use_rag or profile.use_references:
+    # Тариф канала — финальный гейт (tiers.py): на тарифах без `rag` оба флага
+    # игнорируются, даже если в профиле остались включёнными (напр. дефолт True
+    # на starter-канале). Так enforced одинаково и в admin-api, и при генерации.
+    rag_allowed = allows(getattr(profile, "subscription_tier", None), "rag")
+    use_own = profile.use_rag and rag_allowed
+    use_refs = profile.use_references and rag_allowed
+    if use_own or use_refs:
         rag_context = get_retriever().retrieve(
             tenant_id,
             topic,
-            include_own=profile.use_rag,
-            include_references=profile.use_references,
+            include_own=use_own,
+            include_references=use_refs,
         )
     else:
         rag_context = None
