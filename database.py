@@ -367,6 +367,27 @@ def is_tenant_owner(tenant_id: str, owner_id: str) -> bool:
         return bool(profile and profile.owner_id == owner_id)
 
 
+def count_tenants_for_owner(owner_id: str) -> int:
+    """Сколько каналов у клиента — для квоты max_channels (см. tiers.py)."""
+    with Session(engine, expire_on_commit=False) as session:
+        return len(
+            session.exec(
+                select(TenantProfile.id).where(TenantProfile.owner_id == owner_id)
+            ).all()
+        )
+
+
+def get_owner_tiers(owner_id: str) -> List[str]:
+    """Тарифы всех каналов клиента — чтобы вычислить его «лучший» (tiers.best_tier)."""
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(TenantProfile.subscription_tier).where(
+                TenantProfile.owner_id == owner_id
+            )
+        ).all()
+        return [r for r in rows if r]
+
+
 def assign_tenant_owner(tenant_id: str, owner_id: Optional[str]) -> Optional[TenantProfile]:
     """Назначает (или снимает, если owner_id=None) владельца тенанта."""
     return update_tenant_profile(tenant_id, owner_id=owner_id)
