@@ -44,13 +44,15 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "analytics": "full",
     },
     "premium": {
-        "max_channels": UNLIMITED,
-        "max_sources": UNLIMITED,
-        "max_posts_per_day": UNLIMITED,
+        # Конечные потолки (НЕ UNLIMITED) — расходы на LLM/картинки растут с объёмом,
+        # безлимит = неконтролируемый счёт. Поднимать осознанно.
+        "max_channels": 10,
+        "max_sources": 15,
+        "max_posts_per_day": 10,
         "scheduling": True,
         "repost_mode": True,
         "rag": True,
-        "image_generation": True,
+        "image_generation": True,    # единственная фича сверх pro
         "manual_publish": True,
         "analytics": "full",
     },

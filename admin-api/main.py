@@ -49,6 +49,8 @@ from database import (
     get_all_tenants,
     get_tenant_profile,
     get_tenant_rules,
+    add_tenant_rule,
+    remove_tenant_rule,
     get_tenant_sources,
     get_recent_posts,
     get_tenant_stats,
@@ -389,6 +391,12 @@ class RulesListResponse(BaseModel):
     rules: List[RuleSchema]
 
 
+class RuleCreateRequest(BaseModel):
+    # forbidden_topic | required_hashtag | formatting | length_limit | stylistic
+    rule_type: str
+    rule_value: str
+
+
 class ScheduleSchema(BaseModel):
     mode: str  # "off", "frequency", "times"
     active: bool
@@ -711,6 +719,68 @@ async def get_rules(
         for r in rules
     ]
     return RulesListResponse(rules=result)
+
+
+# Допустимые типы правил (см. TenantRule в database.py). Системные правила
+# (is_system) клиент не создаёт и не удаляет — это служебные правила канала.
+_RULE_TYPES = {
+    "forbidden_topic",
+    "required_hashtag",
+    "formatting",
+    "length_limit",
+    "stylistic",
+}
+
+
+@app.post("/api/admin/tenants/{tenant_id}/rules", response_model=RuleSchema, tags=["Rules"])
+async def create_rule(
+    tenant_id: str,
+    req: RuleCreateRequest,
+    principal: Principal = Depends(get_principal),
+) -> RuleSchema:
+    """Добавить пользовательское правило канала (не системное)."""
+    await _require_tenant(principal, tenant_id)
+
+    if req.rule_type not in _RULE_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"rule_type must be one of {sorted(_RULE_TYPES)}",
+        )
+    if not req.rule_value.strip():
+        raise HTTPException(status_code=422, detail="rule_value must not be empty")
+
+    rule = await asyncio.to_thread(
+        add_tenant_rule, tenant_id, req.rule_type, req.rule_value.strip(), False
+    )
+    return RuleSchema(
+        id=rule.id,
+        rule_type=rule.rule_type,
+        rule_value=rule.rule_value,
+        created_at=rule.created_at.isoformat() if rule.created_at else None,
+    )
+
+
+@app.delete("/api/admin/tenants/{tenant_id}/rules/{rule_id}", tags=["Rules"])
+async def delete_rule(
+    tenant_id: str,
+    rule_id: int,
+    principal: Principal = Depends(get_principal),
+):
+    """Удалить пользовательское правило канала.
+
+    Проверяем, что правило принадлежит этому каналу и не системное — иначе по
+    rule_id можно было бы трогать чужие/служебные правила.
+    """
+    await _require_tenant(principal, tenant_id)
+
+    rules = await asyncio.to_thread(get_tenant_rules, tenant_id, False)
+    if not any(r.id == rule_id for r in rules):
+        raise HTTPException(status_code=404, detail="Rule not found for this tenant")
+
+    ok = await asyncio.to_thread(remove_tenant_rule, rule_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return {"success": True, "message": "Rule removed"}
 
 
 def _probe_rag_ready() -> str:

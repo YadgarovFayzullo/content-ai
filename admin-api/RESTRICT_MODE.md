@@ -152,6 +152,7 @@ GET /api/admin/me
 | `GET /tenants/{id}/profile` | владелец/супер | — |
 | `GET /tenants/{id}/stats` | владелец/супер | starter: окно ≤ 7 дн, без `by_topic` |
 | `GET /tenants/{id}/posts` `…/sources` `…/rules` `…/rag-status` `…/avatar` | владелец/супер | — |
+| `POST /tenants/{id}/rules`, `DELETE …/rules/{rule_id}` | владелец/супер | — |
 | `PATCH /tenants/{id}/profile` | владелец/супер | `use_rag`/`use_references`→`rag`; `content_mode="repost"`→`repost_mode`; `schedule_mode≠off`/`posts_per_day`→`scheduling` + `max_posts_per_day` |
 | `POST /tenants/{id}/sources` | владелец/супер | `max_sources` (новый источник сверх лимита → `403`) |
 | `PATCH …/sources/{sid}/priority`, `DELETE …/sources/{sid}` | владелец/супер | — |
@@ -182,6 +183,26 @@ GET /api/admin/me
 
 На starter любая попытка включить расписание → `403 tier_restricted (scheduling)`.
 На pro `posts_per_day > 5` → `403 tier_quota_exceeded (max_posts_per_day)`.
+
+### Правила канала (Rules)
+
+`GET /tenants/{id}/rules` отдаёт только **пользовательские** правила (системные,
+создаваемые при подключении канала, скрыты). Создание/удаление — тоже только
+пользовательские:
+
+```
+POST /api/admin/tenants/{id}/rules
+  body { "rule_type": "...", "rule_value": "..." }
+  → 200 { id, rule_type, rule_value, created_at }
+
+DELETE /api/admin/tenants/{id}/rules/{rule_id}
+  → 200 { success: true }
+```
+
+`rule_type` — одно из: `forbidden_topic`, `required_hashtag`, `formatting`,
+`length_limit`, `stylistic` (иначе `422`). Пустой `rule_value` → `422`.
+Удаление чужого/несуществующего/системного `rule_id` → `404`. Тарифного гейта на
+правила нет.
 
 ---
 
