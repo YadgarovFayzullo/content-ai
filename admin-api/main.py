@@ -905,6 +905,53 @@ async def generate_post_preview(
     return GenerateResponse(text=result["text"], topic=result["topic"])
 
 
+class SuggestTopicsRequest(BaseModel):
+    # Текущие (возможно ещё не сохранённые) значения формы — подбор идёт по ним.
+    post_template: Optional[str] = None
+    writing_style: Optional[str] = None
+    audience: Optional[str] = None
+    tone: Optional[str] = None
+    language: Optional[str] = None
+    content_mode: Optional[str] = None
+    count: Optional[int] = 12
+
+
+class SuggestTopicsResponse(BaseModel):
+    topics: List[str]
+
+
+@app.post(
+    "/api/admin/tenants/{tenant_id}/suggest-topics",
+    response_model=SuggestTopicsResponse,
+    tags=["Generate"],
+)
+async def suggest_topics_endpoint(
+    tenant_id: str,
+    req: SuggestTopicsRequest,
+    principal: Principal = Depends(get_principal),
+) -> SuggestTopicsResponse:
+    """Подобрать темы (topics) через ИИ по тому, что владелец уже вписал в
+    контент-поля (шаблон/стиль/аудитория). Не сохраняет — фронт сам подставляет."""
+    from generator import suggest_topics
+
+    await _require_tenant(principal, tenant_id)
+    try:
+        topics = await asyncio.to_thread(
+            suggest_topics,
+            post_template=req.post_template or "",
+            writing_style=req.writing_style or "",
+            audience=req.audience or "",
+            tone=req.tone or "",
+            language=req.language or "",
+            content_mode=req.content_mode or "topic",
+            count=min(max(req.count or 12, 1), 30),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return SuggestTopicsResponse(topics=topics)
+
+
 @app.post("/api/admin/tenants/{tenant_id}/sources", response_model=SourceAddResponse, tags=["Sources"])
 async def add_source(
     tenant_id: str,

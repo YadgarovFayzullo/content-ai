@@ -90,6 +90,57 @@ def groq_chat(
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"] or ""
 
+
+def suggest_topics(
+    *,
+    post_template: str = "",
+    writing_style: str = "",
+    audience: str = "",
+    tone: str = "",
+    language: str = "",
+    content_mode: str = "topic",
+    count: int = 12,
+) -> List[str]:
+    """Предлагает список тем (topics) для канала на основе того, что владелец уже
+    задал: шаблон поста, стиль, аудитория, тон. Решает ловушку «пустые темы +
+    тематический шаблон» — ИИ подбирает конкретные темы под рубрику.
+
+    Если шаблон содержит плейсхолдер (<country>/<destination>/<product>...), ИИ
+    предлагает конкретные значения для него. Возвращает до `count` коротких тем.
+    """
+    cfg = "\n".join(
+        [
+            f"post_template: {post_template or '(none)'}",
+            f"writing_style: {writing_style or '(none)'}",
+            f"audience: {audience or '(none)'}",
+            f"tone: {tone or '(none)'}",
+            f"language: {language or '(infer from the template/style)'}",
+            f"content_mode: {content_mode}",
+        ]
+    )
+    system = (
+        "You suggest concrete POST TOPICS for a Telegram channel from its content "
+        "configuration. Each topic is a short phrase (1-4 words) the channel can "
+        "write a separate post about. If the post_template has a placeholder such "
+        "as <country>, <destination>, <product>, <city>, suggest concrete fillers "
+        "for it (e.g. real countries). Topics must be in the channel's own language "
+        f"(match the template/style). Return EXACTLY {count} topics as a single "
+        "comma-separated line. No numbering, no quotes, no commentary, no trailing dot."
+    )
+    user = f"CONTENT CONFIGURATION:\n{cfg}\n\nReturn {count} comma-separated topics."
+    raw = groq_chat(system, user, temperature=0.7)
+
+    # Парсим устойчиво: режем по запятым/переводам строк, чистим нумерацию/кавычки/буллеты.
+    out: List[str] = []
+    seen = set()
+    for part in re.split(r"[,\n]", raw):
+        t = re.sub(r"^\s*\d+[\.\)]\s*", "", part).strip().strip("\"'`•-–*").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out[:count]
+
+
 DEFAULT_IMAGE_STYLE = (
     "Editorial gouache illustration of silhouettes interacting with floating books and symbols "
     "of knowledge in a surreal abstract educational space. Rough brush strokes, thick paint texture, "
