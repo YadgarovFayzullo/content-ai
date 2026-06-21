@@ -6,9 +6,12 @@
 # (envsubst) при старте. Переменные nginx ($host/$remote_addr/...) не трогаются,
 # т.к. их нет в окружении.
 
-upstream admin_api {
-    server admin-api:8001;
-}
+# Апстрим НЕ задаём статически: статический `server admin-api:8001` резолвится
+# один раз при старте nginx и кэширует IP. После пересборки контейнера admin-api
+# его IP меняется → nginx стучится на старый адрес → 502, пока nginx не перезапустят.
+# Вместо этого резолвим имя в рантайме через встроенный DNS Docker (127.0.0.11):
+# имя кладём в переменную, и nginx резолвит его на каждый запрос (TTL valid=10s).
+# Так пересборка бэкенда больше НЕ требует ручного рестарта nginx.
 
 # --- HTTP :80 — ACME-challenge + редирект на HTTPS --------------------------
 server {
@@ -43,8 +46,14 @@ server {
     # Тело запросов с превью/генерацией может быть крупным.
     client_max_body_size 10m;
 
+    # Встроенный DNS Docker — для рантайм-резолвинга имени admin-api.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
     location / {
-        proxy_pass http://admin_api;
+        # Имя в переменной → nginx резолвит его в рантайме (а не один раз на старте),
+        # поэтому новый IP контейнера подхватывается без рестарта nginx.
+        set $admin_api admin-api:8001;
+        proxy_pass http://$admin_api;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
