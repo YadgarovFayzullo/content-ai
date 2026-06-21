@@ -9,29 +9,35 @@ services:
       POSTGRES_DB: ${DB_NAME:-content_ai}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # Bridge + проброс порта: admin-api ходит по имени `db:5432`,
-    # bot (host-режим) — через 127.0.0.1:5432.
-    ports:
-      - "5432:5432"
+    # Internal-only. Достижим по имени `db:5432` для всех на content_ai_net.
+    # НЕ публикуется наружу. Для локального psql временно раскомментируйте loopback:
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    expose:
+      - "5432"
+    networks:
+      - content_ai_net
 
   bot:
     build: .
     container_name: content_ai_bot
-    network_mode: host
     restart: always
     depends_on:
       - db
     env_file: .env
     environment:
-      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@127.0.0.1:5432/${DB_NAME:-content_ai}
-      # Внутренний API слушаем ТОЛЬКО на docker-bridge gateway, а не на 0.0.0.0:
-      # в host-режиме это не даёт порту 8002 торчать в публичный интерфейс VPS.
-      # Достукивается лишь admin-api из bridge-сети. При коллизии подсети — поменять
-      # DOCKER_GATEWAY/DOCKER_SUBNET в .env (см. networks ниже).
-      - INTERNAL_API_HOST=${DOCKER_GATEWAY:-172.21.0.1}
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
+      # Внутренний API (publish / publish-all / collect-metrics). Бот на bridge-сети,
+      # порт 8002 НЕ публикуется — биндим 0.0.0.0 внутри контейнера, снаружи он
+      # недостижим, а admin-api ходит по имени `bot:8002` внутри content_ai_net.
+      - INTERNAL_API_HOST=0.0.0.0
+      # RAG в отдельном compose, подключённом к той же внешней сети как `rag-api`.
+      - RAG_URL=http://rag-api:8000
     volumes:
       - ./gen_images:/app/gen_images
       - ./bot.log:/app/bot.log
+    networks:
+      - content_ai_net
 
   admin-api:
     build:
@@ -42,29 +48,48 @@ services:
     depends_on:
       - db
     env_file: .env
-    # Bridge-сеть + проброс порта (как у RAG): доступен с хоста на :8001.
-    # До db ходим по имени сервиса; до RAG (отдельный контейнер, host-режим) —
-    # через host-gateway (работает и на macOS Docker Desktop, и на Linux-VPS).
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # Internal-only. Наружу НЕ публикуется: единственный публичный edge — nginx,
+    # который проксирует сюда по имени `admin-api:8001`. db / rag / bot достижимы
+    # по именам сервисов внутри content_ai_net. Для локального curl/debug временно:
+    # ports:
+    #   - "127.0.0.1:8001:8001"
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
-      - RAG_URL=http://host.docker.internal:8000
-      # Внутренний API бота (publish / publish-all / collect-metrics). Бот слушает
-      # на gateway этой сети (см. INTERNAL_API_HOST) — ходим туда напрямую.
-      - INTERNAL_BOT_URL=http://${DOCKER_GATEWAY:-172.21.0.1}:8002
-    ports:
-      - "8001:8001"
+      - RAG_URL=http://rag-api:8000
+      - INTERNAL_BOT_URL=http://bot:8002
+    expose:
+      - "8001"
+    networks:
+      - content_ai_net
 
-# Подсеть проекта закреплена, чтобы IP gateway был детерминирован: бот (host-режим)
-# биндит на него внутренний API, admin-api по нему же ходит. На VPS при конфликте
-# с занятой подсетью — задать DOCKER_SUBNET/DOCKER_GATEWAY в .env.
+  # Единственный публичный edge. Только nginx публикует порты наружу (80/443);
+  # admin-api / db / rag / bot-api остаются приватными внутри content_ai_net.
+  # TLS терминируется здесь (см. nginx/nginx.conf).
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: content_ai_nginx
+    restart: always
+    depends_on:
+      - admin-api
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Сертификаты (Let's Encrypt и т.п.) монтируем сюда и раскомментируем 443 в конфиге.
+      - ./nginx/certs:/etc/nginx/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - content_ai_net
+
+# Общая внешняя сеть. Граница безопасности = «состоит ли контейнер в этой сети»,
+# а не IP/интерфейс. Внутренние сервисы (db/rag/bot-api/admin-api) не публикуют
+# портов вовсе — наружу торчит только nginx. RAG-проект (отдельный compose)
+# подключается к ЭТОЙ ЖЕ сети, поэтому она external и создаётся один раз:
+#   docker network create content_ai_net
 networks:
-  default:
-    ipam:
-      config:
-        - subnet: ${DOCKER_SUBNET:-172.21.0.0/16}
-          gateway: ${DOCKER_GATEWAY:-172.21.0.1}
+  content_ai_net:
+    external: true
+    name: content_ai_net
 
 volumes:
   postgres_data:

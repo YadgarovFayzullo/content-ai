@@ -40,10 +40,10 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
 # (https://t.me/<username>?start=auth_<token>). Если не задан — отдаём только токен.
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 
-# Внутренний API бота (publish / publish-all / collect-metrics). Бот работает в
-# network_mode: host, поэтому из этого контейнера (bridge) достукиваемся через
-# host-gateway. Общий секрет — ADMIN_TOKEN из .env (заголовок X-Internal-Token).
-INTERNAL_BOT_URL = os.getenv("INTERNAL_BOT_URL", "http://host.docker.internal:8002")
+# Внутренний API бота (publish / publish-all / collect-metrics). Бот в той же
+# bridge-сети content_ai_net — ходим по имени сервиса `bot:8002`. Общий секрет —
+# ADMIN_TOKEN из .env (заголовок X-Internal-Token).
+INTERNAL_BOT_URL = os.getenv("INTERNAL_BOT_URL", "http://bot:8002")
 from database import (
     TenantProfile,
     get_all_tenants,

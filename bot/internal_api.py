@@ -6,8 +6,9 @@ admin-api — тонкий сервис без aiogram/Telethon, поэтому 
 конфликтов блокировок SQLite).
 
 Сервер поднимается в том же процессе/loop, что и polling (см. main.py), на
-порту INTERNAL_API_PORT. Контейнер бота работает в network_mode: host, поэтому
-admin-api достукивается до него по http://host.docker.internal:<port>.
+порту INTERNAL_API_PORT. Бот на общей bridge-сети content_ai_net; порт 8002
+НЕ публикуется наружу — admin-api достукивается до него по имени `bot:8002`
+внутри сети.
 
 Аутентификация — общий секрет ADMIN_TOKEN из .env (заголовок X-Internal-Token).
 Эндпоинты не предназначены для внешнего доступа.
@@ -30,9 +31,9 @@ from bot.scheduler import scheduled_job
 from bot.metrics import collect_metrics
 
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8002"))
-# По умолчанию слушаем только Docker-bridge gateway, а не 0.0.0.0 — так порт не
-# виден из публичного интерфейса VPS (бот в network_mode: host), и его не нужно
-# закрывать файрволом. Достукивается лишь admin-api из bridge-сети.
+# В контейнере биндим 0.0.0.0 (compose задаёт INTERNAL_API_HOST=0.0.0.0): порт
+# 8002 не публикуется наружу, поэтому достижим лишь по имени `bot:8002` внутри
+# content_ai_net. Дефолт 127.0.0.1 — безопасный для локального запуска без Docker.
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "127.0.0.1")
 _INTERNAL_TOKEN = os.getenv("ADMIN_TOKEN", "a12345678")
 
