@@ -327,16 +327,28 @@ def _build_user_context(ctx: GenerationContext) -> str:
             f"creativity_level: {p.creativity_level}",
             f"factual_strictness: {p.factual_strictness}",
             "",
+            # Жёсткий язык-лок: модель оставляла имена собственные на исходном языке
+            # (TOPIC="Sydney" → заголовок "Discover Sydney" при русском контенте).
+            "## LANGUAGE LOCK (critical)",
+            f"Write the ENTIRE post strictly in {p.language}. This includes ALL proper "
+            f"nouns — place, city, country and brand names from the TOPIC and facts MUST "
+            f"be transliterated/localized into {p.language} (e.g. for Russian: "
+            f"'Sydney'→'Сидней', 'Barcelona'→'Барселона', 'New York'→'Нью-Йорк'). "
+            f"Do NOT leave any word in English or another language (no 'iconic', no raw "
+            f"Latin names). The TOPIC may be given in English — localize it before use.",
+            "",
             # Явные тумблеры стиля — переопределяют общие правила system-промпта.
             "## STYLE TOGGLES (override the general EMOJI/HASHTAG rules above)",
             (
-                "EMOJI: allowed — use sparingly (2-4 per post), only where they add value."
+                "EMOJI: ENABLED — actively use relevant emoji to improve readability: a "
+                "fitting emoji in the title and at the start of MOST list items/sections "
+                "(aim for ~5-8 per post). Keep them relevant, don't spam."
                 if getattr(p, "use_emoji", True)
                 else "EMOJI: DISABLED — do NOT use any emoji anywhere in the post."
             ),
             (
                 "HASHTAGS: ENABLED — end the post with 2-4 relevant hashtags on a "
-                "separate last paragraph (preceded by a blank line)."
+                f"separate last paragraph (preceded by a blank line), written in {p.language}."
                 if getattr(p, "use_hashtags", False)
                 else "HASHTAGS: DISABLED — do NOT add hashtags (unless a TENANT RULE "
                 "explicitly requires a specific one)."
@@ -446,7 +458,12 @@ def _sanitize_post(text: str, ctx: GenerationContext) -> str:
     """Детерминированная подчистка вывода: убрать ведущее приветствие/обращение к
     аудитории по имени канала + конвертировать Markdown-разметку в Telegram-HTML.
     Реальные контакты/вакансии (@..., ссылки, названия) НЕ трогаем."""
-    return _md_to_html(_strip_leading_greeting(text))
+    out = _md_to_html(_strip_leading_greeting(text))
+    # Схлопнуть лишние пустые строки: правила «хэштеги/CTA отдельным абзацем»
+    # заставляют модель плодить по 2-3 пустых строки подряд — в Telegram это
+    # выглядит как большие «пустоты». Оставляем максимум одну пустую строку.
+    out = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", out)
+    return out.strip()
 
 
 # ---------------------------------------------------------------------------
