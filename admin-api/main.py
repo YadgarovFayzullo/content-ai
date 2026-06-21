@@ -295,7 +295,8 @@ class TenantProfileSchema(BaseModel):
     subscription_tier: str = "starter"
     schedule_mode: str = "off"
     posts_per_day: int = 0
-    post_times: str = ""
+    # Фронт ожидает массив schedule_times (а PATCH принимает post_times строкой).
+    schedule_times: List[str] = []
     capabilities: dict = {}
 
 
@@ -328,7 +329,11 @@ def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
         subscription_tier=tier,
         schedule_mode=getattr(profile, "schedule_mode", None) or "off",
         posts_per_day=getattr(profile, "posts_per_day", 0) or 0,
-        post_times=getattr(profile, "post_times", None) or "",
+        schedule_times=[
+            t.strip()
+            for t in (getattr(profile, "post_times", None) or "").split(",")
+            if t.strip()
+        ],
         capabilities=limits_for(tier),
     )
 
