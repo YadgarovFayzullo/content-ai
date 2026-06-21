@@ -24,6 +24,7 @@ from bot.dialogs import (
 from bot.scheduler import schedule_tick, reindex_references
 from bot.metrics import collect_metrics
 from bot.internal_api import start_internal_api
+from bot.system_watch import system_watch, system_digest
 from bot import rag_client
 from database import create_db_and_tables
 from rag import set_retriever
@@ -90,6 +91,11 @@ async def main():
     # Ежедневный пере-скрейпинг референс-каналов (раз в сутки, ночью) — пул фактов
     # растёт сам, не «застывает» на снимке момента добавления.
     scheduler.add_job(reindex_references, "cron", hour=5, minute=0)
+    # Мониторинг сервера: наблюдатель шлёт супер-админу новые инциденты (контейнер
+    # упал, диск/CPU/RAM на пределе, ошибки в логах) раз в 2 минуты; ежедневный
+    # дайджест — сводка по контейнерам/ресурсам в 9:00.
+    scheduler.add_job(system_watch, "interval", minutes=2, args=[bot])
+    scheduler.add_job(system_digest, "cron", hour=9, minute=5, args=[bot])
     scheduler.start()
     # Внутренний HTTP-API для admin-api (publish / publish-all / collect-metrics):
     # бот — единственный владелец aiogram-Bot и Telethon-сессии.

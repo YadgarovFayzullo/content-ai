@@ -29,6 +29,7 @@ from publisher import send_to_telegram
 from repost import produce_content
 from bot.scheduler import scheduled_job
 from bot.metrics import collect_metrics
+from monitoring import collect_status
 
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8002"))
 # В контейнере биндим 0.0.0.0 (compose задаёт INTERNAL_API_HOST=0.0.0.0): порт
@@ -138,6 +139,17 @@ async def handle_collect_metrics(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "saved": saved})
 
 
+async def handle_system_status(request: web.Request) -> web.Response:
+    """GET /internal/system-status → снимок здоровья сервера (для админ-панели).
+
+    Бот — единственный контейнер с примонтированным docker.sock, поэтому сбор
+    статуса живёт здесь, а admin-api проксирует.
+    """
+    _check_auth(request)
+    snap = await collect_status(with_logs=True)
+    return web.json_response(snap)
+
+
 def create_internal_app(bot: Bot) -> web.Application:
     app = web.Application()
     app["bot"] = bot
@@ -151,6 +163,8 @@ def create_internal_app(bot: Bot) -> web.Application:
     # Глобальный сбор метрик (по всем каналам) — как кнопка в боте. collect_metrics()
     # и так собирает по всем арендаторам, поэтому переиспользуем тот же хэндлер.
     app.router.add_post("/internal/collect-metrics", handle_collect_metrics)
+    # Мониторинг сервера (контейнеры/ресурсы/логи) — рендерится в админ-панели.
+    app.router.add_get("/internal/system-status", handle_system_status)
     return app
 
 

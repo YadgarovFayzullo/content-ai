@@ -1238,6 +1238,16 @@ async def collect_metrics_all_endpoint(
     return await _proxy_to_bot("POST", "/internal/collect-metrics")
 
 
+@app.get("/api/admin/system-status", tags=["System"])
+async def system_status_endpoint(
+    principal: Principal = Depends(get_principal),
+):
+    """Снимок здоровья сервера (контейнеры/ресурсы/логи/инциденты). Только
+    супер-админ. Сбор делает бот (у него примонтирован docker.sock)."""
+    _require_super(principal)
+    return await _proxy_to_bot("GET", "/internal/system-status")
+
+
 # Health check
 @app.get("/api/admin/health")
 async def health():

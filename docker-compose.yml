@@ -44,6 +44,10 @@ services:
       - RAG_URL=http://rag-api:8000
     volumes:
       - ./gen_images:/app/gen_images
+      # Docker Engine API (read-only) для мониторинга: контейнеры/ресурсы/логи.
+      # Бот — единственный контейнер с доступом к сокету; admin-api берёт статус
+      # через внутренний API бота, а не напрямую (меньше площадь доступа к сокету).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     # bot.log НЕ монтируем файлом: на свежем сервере хоста-файла нет, и Docker
     # создаёт его КАТАЛОГОМ → FileHandler падает с IsADirectoryError. Логи и так
     # идут в stdout (StreamHandler) и доступны через `docker logs`.
