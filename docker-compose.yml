@@ -15,6 +15,14 @@ services:
     #   - "127.0.0.1:5432:5432"
     expose:
       - "5432"
+    # Healthcheck — чтобы admin-api/bot стартовали только когда Postgres реально
+    # принимает соединения (depends_on без этого ждёт лишь старт контейнера, а не
+    # готовность БД → гонка и краш-луп на первом запуске).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-content_ai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks:
       - content_ai_net
 
@@ -23,7 +31,8 @@ services:
     container_name: content_ai_bot
     restart: always
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
@@ -46,7 +55,8 @@ services:
     container_name: content_ai_admin_api
     restart: always
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file: .env
     # Internal-only. Наружу НЕ публикуется: единственный публичный edge — nginx,
     # который проксирует сюда по имени `admin-api:8001`. db / rag / bot достижимы
