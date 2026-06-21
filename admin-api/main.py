@@ -590,14 +590,22 @@ async def list_tenants(
     return TenantListResponse(tenants=[_tenant_schema(t) for t in tenants])
 
 
-@app.get("/api/admin/tenants/{tenant_id}/profile", response_model=TenantProfileSchema, tags=["Tenants"])
+class ProfileResponse(BaseModel):
+    profile: TenantProfileSchema
+
+
+@app.get("/api/admin/tenants/{tenant_id}/profile", response_model=ProfileResponse, tags=["Tenants"])
 async def get_profile(
     tenant_id: str,
     principal: Principal = Depends(get_principal),
-) -> TenantProfileSchema:
-    """Получить полный профиль канала (только свой/любой для супера)."""
+) -> ProfileResponse:
+    """Получить полный профиль канала (только свой/любой для супера).
+
+    Обёртка {"profile": ...} — фронт ожидает именно её (ProfileResponse). Раньше
+    отдавали профиль плоско → фронт читал .profile = undefined → форма канала не
+    загружала данные с сервера («исчезают после перезагрузки»)."""
     profile = await _require_tenant(principal, tenant_id)
-    return _tenant_schema(profile)
+    return ProfileResponse(profile=_tenant_schema(profile))
 
 
 @app.get("/api/admin/tenants/{tenant_id}/avatar", tags=["Tenants"])
