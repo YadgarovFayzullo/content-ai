@@ -89,6 +89,11 @@ class TenantProfile(SQLModel, table=True):
     # (клиент хочет, чтобы инфо бралась исключительно из его постов, без чужих).
     use_references: bool = True
 
+    # Стилевые тумблеры контента. use_emoji — разрешать ли эмодзи в постах (умеренно);
+    # use_hashtags — добавлять ли хэштеги в конце поста. Читаются генератором.
+    use_emoji: bool = True
+    use_hashtags: bool = False
+
     # Автопостинг по расписанию:
     #   off       — выключено
     #   frequency — posts_per_day раз в день, равномерно по окну 09:00–21:00
@@ -270,6 +275,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "cta": "VARCHAR DEFAULT ''",
         "use_rag": "BOOLEAN DEFAULT TRUE",
         "use_references": "BOOLEAN DEFAULT TRUE",
+        "use_emoji": "BOOLEAN DEFAULT TRUE",
+        "use_hashtags": "BOOLEAN DEFAULT FALSE",
         "content_mode": "VARCHAR DEFAULT 'topic'",
     },
     "posts_history": {

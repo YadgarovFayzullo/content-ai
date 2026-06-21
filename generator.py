@@ -327,6 +327,21 @@ def _build_user_context(ctx: GenerationContext) -> str:
             f"creativity_level: {p.creativity_level}",
             f"factual_strictness: {p.factual_strictness}",
             "",
+            # Явные тумблеры стиля — переопределяют общие правила system-промпта.
+            "## STYLE TOGGLES (override the general EMOJI/HASHTAG rules above)",
+            (
+                "EMOJI: allowed — use sparingly (2-4 per post), only where they add value."
+                if getattr(p, "use_emoji", True)
+                else "EMOJI: DISABLED — do NOT use any emoji anywhere in the post."
+            ),
+            (
+                "HASHTAGS: ENABLED — end the post with 2-4 relevant hashtags on a "
+                "separate last paragraph (preceded by a blank line)."
+                if getattr(p, "use_hashtags", False)
+                else "HASHTAGS: DISABLED — do NOT add hashtags (unless a TENANT RULE "
+                "explicitly requires a specific one)."
+            ),
+            "",
             "## TENANT RULES",
             _format_rules(ctx.rules),
             "",

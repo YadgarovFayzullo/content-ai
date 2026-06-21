@@ -282,6 +282,8 @@ class TenantProfileSchema(BaseModel):
     factual_strictness: float
     use_rag: bool
     use_references: bool
+    use_emoji: bool = True
+    use_hashtags: bool = False
     avg_post_length: Optional[int]
     content_mode: str = "topic"
     active: bool
@@ -314,6 +316,8 @@ def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
         factual_strictness=profile.factual_strictness,
         use_rag=profile.use_rag,
         use_references=profile.use_references,
+        use_emoji=getattr(profile, "use_emoji", True),
+        use_hashtags=getattr(profile, "use_hashtags", False),
         avg_post_length=profile.avg_post_length,
         content_mode=getattr(profile, "content_mode", None) or "topic",
         active=profile.active,
@@ -435,6 +439,8 @@ class ProfileUpdateRequest(BaseModel):
     topics: Optional[str] = None
     use_references: Optional[bool] = None
     use_rag: Optional[bool] = None
+    use_emoji: Optional[bool] = None
+    use_hashtags: Optional[bool] = None
     content_mode: Optional[str] = None
     active: Optional[bool] = None
     # Стиль/рубрика контента (topic-режим). post_template — шаблон/рубрика поста
