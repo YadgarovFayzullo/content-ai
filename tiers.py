@@ -25,7 +25,7 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "max_channels": 1,          # каналов на клиента (по лучшему тарифу его каналов)
         "max_sources": 1,           # референс-источников на канал
         "max_posts_per_day": 1,     # потолок авто-расписания
-        "scheduling": False,        # авто-постинг по расписанию
+        "scheduling": True,         # авто-постинг по расписанию
         "repost_mode": False,       # content_mode = "repost"
         "rag": False,               # use_rag / use_references
         "image_generation": False,  # картинки к постам
