@@ -95,9 +95,13 @@ services:
       - "443:443"
     networks:
       - content_ai_net
-    # Перечитываем конфиг каждые 6ч, чтобы подхватить продлённый certbot сертификат.
+    # Сначала рендерим шаблон (образ nginx делает это только если CMD начинается с
+    # `nginx`; у нас своя команда, поэтому вызываем envsubst-скрипт вручную), затем
+    # раз в 6ч перечитываем конфиг, чтобы подхватить продлённый certbot сертификат.
     command: >-
-      /bin/sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"
+      /bin/sh -c "/docker-entrypoint.d/20-envsubst-on-templates.sh;
+      { while :; do sleep 6h & wait $${!}; nginx -s reload; done; } &
+      exec nginx -g 'daemon off;'"
 
   # Let's Encrypt: авто-продление сертификата (webroot http-01). Первичную выдачу
   # делает ./init-letsencrypt.sh; этот сервис лишь крутит renew раз в 12ч.
@@ -108,6 +112,8 @@ services:
     volumes:
       - ./nginx/letsencrypt:/etc/letsencrypt
       - ./nginx/www:/var/www/certbot
+    networks:
+      - content_ai_net
     entrypoint: >-
       /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done"
 
