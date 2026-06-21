@@ -1,0 +1,161 @@
+"""Внутренний HTTP-API бота для admin-api (action-эндпоинты).
+
+admin-api — тонкий сервис без aiogram/Telethon, поэтому реальные действия
+(публикация, массовая публикация, сбор метрик) он делегирует сюда: бот остаётся
+единственным владельцем aiogram-Bot и Telethon-сессии (нет дубля сессии и
+конфликтов блокировок SQLite).
+
+Сервер поднимается в том же процессе/loop, что и polling (см. main.py), на
+порту INTERNAL_API_PORT. Контейнер бота работает в network_mode: host, поэтому
+admin-api достукивается до него по http://host.docker.internal:<port>.
+
+Аутентификация — общий секрет ADMIN_TOKEN из .env (заголовок X-Internal-Token).
+Эндпоинты не предназначены для внешнего доступа.
+"""
+import asyncio
+import logging
+import os
+
+from aiogram import Bot
+from aiohttp import web
+
+from database import (
+    PostHistory,
+    get_tenant_profile,
+)
+from orchestrator import generate_preview
+from publisher import send_to_telegram
+from repost import produce_content
+from bot.scheduler import scheduled_job
+from bot.metrics import collect_metrics
+
+INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8002"))
+# По умолчанию слушаем только Docker-bridge gateway, а не 0.0.0.0 — так порт не
+# виден из публичного интерфейса VPS (бот в network_mode: host), и его не нужно
+# закрывать файрволом. Достукивается лишь admin-api из bridge-сети.
+INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "127.0.0.1")
+_INTERNAL_TOKEN = os.getenv("ADMIN_TOKEN", "a12345678")
+
+
+def _check_auth(request: web.Request) -> None:
+    """Бросает 401, если общий секрет не совпал."""
+    if request.headers.get("X-Internal-Token") != _INTERNAL_TOKEN:
+        raise web.HTTPUnauthorized(reason="bad internal token")
+
+
+async def _publish_text(bot: Bot, profile, text: str, topic: str):
+    """Публикует уже готовый текст (без картинки) и возвращает (ok, detail, msg_id)."""
+    entry = PostHistory(
+        tenant_id=profile.tenant_id,
+        topic=topic or "",
+        content=text,
+        image_path="",
+        posted=False,
+    )
+    content = {"text": text, "image_path": "", "entry": entry}
+    ok, detail = await send_to_telegram(bot, content, profile.chat_id)
+    return ok, detail, (entry.message_id if ok else None)
+
+
+async def handle_publish(request: web.Request) -> web.Response:
+    """POST /internal/tenants/{tenant_id}/publish
+
+    Body {text?, topic?, context?}:
+      - text       → публикуем как есть (без картинки);
+      - topic/context (без text) → generate_preview → публикуем текст (без картинки);
+      - ничего     → produce_content (полный пайплайн: картинка, repost-режим).
+    """
+    _check_auth(request)
+    tenant_id = request.match_info["tenant_id"]
+    body = await request.json() if request.can_read_body else {}
+    bot: Bot = request.app["bot"]
+
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise web.HTTPNotFound(reason="tenant not found")
+
+    text = (body.get("text") or "").strip()
+    topic = (body.get("topic") or "").strip()
+    context = (body.get("context") or "").strip()
+    # Тариф канала может запрещать картинки — admin-api проставляет allow_image.
+    # По умолчанию True (обратная совместимость / прямые вызовы).
+    allow_image = body.get("allow_image", True)
+
+    try:
+        if text:
+            ok, detail, msg_id = await _publish_text(bot, profile, text, topic)
+        elif topic or context:
+            preview = await asyncio.to_thread(
+                generate_preview, tenant_id, topic or None, context or None
+            )
+            ok, detail, msg_id = await _publish_text(
+                bot, profile, preview["text"], preview["topic"]
+            )
+        else:
+            content = await produce_content(profile)
+            if not allow_image:
+                # Тариф без image_generation — публикуем только текст.
+                content["image_path"] = ""
+            ok, detail = await send_to_telegram(bot, content, profile.chat_id)
+            msg_id = content["entry"].message_id if ok else None
+    except RuntimeError as e:
+        return web.json_response({"success": False, "message": str(e)}, status=502)
+
+    return web.json_response(
+        {
+            "success": ok,
+            "channel": profile.chat_id,
+            "message_id": msg_id,
+            "message": detail,
+        }
+    )
+
+
+async def handle_publish_all(request: web.Request) -> web.Response:
+    """POST /internal/publish-all → массовая публикация во все активные каналы."""
+    _check_auth(request)
+    bot: Bot = request.app["bot"]
+    results = await scheduled_job(bot)
+    return web.json_response(
+        {
+            "results": [
+                {"chat_id": chat_id, "ok": ok, "detail": detail}
+                for chat_id, ok, detail in results
+            ]
+        }
+    )
+
+
+async def handle_collect_metrics(request: web.Request) -> web.Response:
+    """POST /internal/tenants/{tenant_id}/collect-metrics → сбор метрик.
+
+    collect_metrics() работает по всем арендаторам сразу (Telethon), отдельного
+    per-tenant сбора нет; tenant_id в пути принимаем для совместимости с фронтом.
+    """
+    _check_auth(request)
+    saved = await collect_metrics()
+    return web.json_response({"success": True, "saved": saved})
+
+
+def create_internal_app(bot: Bot) -> web.Application:
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post(
+        "/internal/tenants/{tenant_id}/publish", handle_publish
+    )
+    app.router.add_post("/internal/publish-all", handle_publish_all)
+    app.router.add_post(
+        "/internal/tenants/{tenant_id}/collect-metrics", handle_collect_metrics
+    )
+    return app
+
+
+async def start_internal_api(bot: Bot) -> web.AppRunner:
+    """Поднимает внутренний HTTP-сервер рядом с polling (не блокирует loop)."""
+    app = create_internal_app(bot)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=INTERNAL_API_HOST, port=INTERNAL_API_PORT)
+    await site.start()
+    logging.info("Internal API ishga tushdi: %s:%d", INTERNAL_API_HOST, INTERNAL_API_PORT)
+    return runner

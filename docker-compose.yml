@@ -24,6 +24,11 @@ services:
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@127.0.0.1:5432/${DB_NAME:-content_ai}
+      # Внутренний API слушаем ТОЛЬКО на docker-bridge gateway, а не на 0.0.0.0:
+      # в host-режиме это не даёт порту 8002 торчать в публичный интерфейс VPS.
+      # Достукивается лишь admin-api из bridge-сети. При коллизии подсети — поменять
+      # DOCKER_GATEWAY/DOCKER_SUBNET в .env (см. networks ниже).
+      - INTERNAL_API_HOST=${DOCKER_GATEWAY:-172.21.0.1}
     volumes:
       - ./gen_images:/app/gen_images
       - ./bot.log:/app/bot.log
@@ -45,8 +50,21 @@ services:
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
       - RAG_URL=http://host.docker.internal:8000
+      # Внутренний API бота (publish / publish-all / collect-metrics). Бот слушает
+      # на gateway этой сети (см. INTERNAL_API_HOST) — ходим туда напрямую.
+      - INTERNAL_BOT_URL=http://${DOCKER_GATEWAY:-172.21.0.1}:8002
     ports:
       - "8001:8001"
+
+# Подсеть проекта закреплена, чтобы IP gateway был детерминирован: бот (host-режим)
+# биндит на него внутренний API, admin-api по нему же ходит. На VPS при конфликте
+# с занятой подсетью — задать DOCKER_SUBNET/DOCKER_GATEWAY в .env.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.21.0.0/16}
+          gateway: ${DOCKER_GATEWAY:-172.21.0.1}
 
 volumes:
   postgres_data:

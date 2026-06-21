@@ -23,6 +23,7 @@ from bot.dialogs import (
 )
 from bot.scheduler import schedule_tick, reindex_references
 from bot.metrics import collect_metrics
+from bot.internal_api import start_internal_api
 from bot import rag_client
 from database import create_db_and_tables
 from rag import set_retriever
@@ -83,6 +84,9 @@ async def main():
     # растёт сам, не «застывает» на снимке момента добавления.
     scheduler.add_job(reindex_references, "cron", hour=5, minute=0)
     scheduler.start()
+    # Внутренний HTTP-API для admin-api (publish / publish-all / collect-metrics):
+    # бот — единственный владелец aiogram-Bot и Telethon-сессии.
+    await start_internal_api(bot)
     logging.info("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
