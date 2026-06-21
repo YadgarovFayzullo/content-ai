@@ -8,3 +8,6 @@ gen_images/
 .idea/
 .vscode/
 .claude/
+# Let's Encrypt cert material + ACME webroot (generated on the host, never commit)
+nginx/letsencrypt/
+nginx/www/
