@@ -13,7 +13,7 @@ from aiogram.enums import ContentType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile
-from aiogram_dialog import Dialog, DialogManager, StartMode, Window
+from aiogram_dialog import Dialog, DialogManager, ShowMode, StartMode, Window
 from aiogram_dialog.widgets.input import MessageInput
 from aiogram_dialog.widgets.kbd import Button, Cancel, Column, Select, SwitchTo
 from aiogram_dialog.widgets.text import Const, Format
@@ -405,6 +405,10 @@ async def on_publish_channel_selected(
         }
     )
     await _send_preview(callback.message, item_id, content)
+    # ShowMode.SEND — окно подтверждения уходит НОВЫМ сообщением ПОД превью.
+    # Иначе aiogram-dialog редактирует старое окно выбора канала на месте (оно
+    # выше превью), и подтверждение «preview yuqorida» оказывается над превью.
+    dialog_manager.show_mode = ShowMode.SEND
     await dialog_manager.switch_to(PublishSG.confirm)
 
 

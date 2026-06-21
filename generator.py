@@ -338,6 +338,15 @@ def _build_user_context(ctx: GenerationContext) -> str:
             f"Latin names). The TOPIC may be given in English — localize it before use.",
             "",
             # Явные тумблеры стиля — переопределяют общие правила system-промпта.
+            # Пост публикуется как фото с подписью (одно сообщение). Подпись в
+            # Telegram ограничена 1024 символами — иначе фото и текст разъезжаются
+            # на два сообщения. Поэтому держим пост заведомо короче.
+            "## MESSAGE FORMAT (hard limit)",
+            "This post is sent as a PHOTO with the text as its CAPTION — a SINGLE "
+            "message. The WHOLE post (including any HTML tags, emoji and hashtags) MUST "
+            "be UNDER 950 characters. This is a HARD limit that overrides any longer "
+            "target length — be concise, keep facts short.",
+            "",
             "## STYLE TOGGLES (override the general EMOJI/HASHTAG rules above)",
             (
                 "EMOJI: ENABLED — actively use relevant emoji to improve readability: a "
