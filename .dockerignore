@@ -25,3 +25,9 @@
 **/values.dev.yaml
 LICENSE
 README.md
+# nginx/certbot данные (root-owned, боту не нужны и ломают build-контекст)
+nginx
+# локальные дампы/логи/sqlite — в образ не нужны
+**/*.log
+**/*.sql
+**/*.db
