@@ -13,7 +13,8 @@ from typing import TypedDict
 
 from database import TenantProfile, PostHistory, get_tenant_profile
 from context_builder import build_generation_context
-from generator import generate_post, generate_illustration
+from generator import generate_post, generate_illustration, image_subject
+from image_search import fetch_stock_photo_sync
 
 DEFAULT_TOPIC = "psixologiya, fan yoki texnologiya haqida qiziqarli mini-fakt"
 
@@ -87,13 +88,29 @@ def generate_for_tenant(profile: TenantProfile) -> GeneratedContent:
     post_text = generate_post(ctx)
     buf.append(post_text)
 
-    # Картинка необязательна: если генерация недоступна (нет квоты и т.п.) —
-    # публикуем пост без изображения, а не валим его целиком.
-    try:
-        image_path = generate_illustration(ctx, topic)
-    except RuntimeError as e:
-        logging.warning(f"Rasm yaratilmadi ({profile.chat_id}), matnli post: {e}")
-        image_path = ""
+    # Источник картинки задаётся профилем (image_mode):
+    #   "stock" — чистое тематическое фото из интернета (Pexels), БЕЗ надписей;
+    #   "ai" (по умолчанию) — ИИ-иллюстрация.
+    # Картинка необязательна: при сбое публикуем текстовый пост, а не валим его.
+    image_mode = (getattr(profile, "image_mode", "ai") or "ai").lower()
+    image_path = ""
+    if image_mode == "stock":
+        # Визуальный subject (англ.) из текста поста — лучший запрос к Pexels,
+        # чем сырая тема (для «Турции» даст конкретную сцену).
+        try:
+            subject = image_subject(post_text) or topic
+            found = fetch_stock_photo_sync(subject)
+            if found:
+                image_path = found[0]
+        except Exception as e:
+            logging.warning(f"Stock-rasm topilmadi ({profile.chat_id}): {e}")
+        # фото не нашлось → фолбэк на ИИ-иллюстрацию ниже
+    if not image_path:
+        try:
+            image_path = generate_illustration(ctx, topic)
+        except RuntimeError as e:
+            logging.warning(f"Rasm yaratilmadi ({profile.chat_id}), matnli post: {e}")
+            image_path = ""
 
     entry = PostHistory(
         tenant_id=profile.tenant_id,

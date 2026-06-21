@@ -67,6 +67,10 @@ class TenantProfile(SQLModel, table=True):
     # просто RAG-контекст.
     content_mode: str = "topic"
 
+    # Источник картинки в topic-режиме: "ai" — ИИ-иллюстрация (по умолчанию),
+    # "stock" — чистое тематическое фото из интернета (Pexels), без надписей.
+    image_mode: str = "ai"
+
     # Тариф арендатора: starter — только каналы где бот админ; pro — ещё и
     # любые публичные каналы по @username.
     subscription_tier: str = "starter"
@@ -278,6 +282,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "use_emoji": "BOOLEAN DEFAULT TRUE",
         "use_hashtags": "BOOLEAN DEFAULT FALSE",
         "content_mode": "VARCHAR DEFAULT 'topic'",
+        "image_mode": "VARCHAR DEFAULT 'ai'",
     },
     "posts_history": {
         "message_id": "INTEGER",

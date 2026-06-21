@@ -286,6 +286,7 @@ class TenantProfileSchema(BaseModel):
     use_hashtags: bool = False
     avg_post_length: Optional[int]
     content_mode: str = "topic"
+    image_mode: str = "ai"
     active: bool
     created_at: str
     # Владелец (Telegram user_id) и тариф — для restrict mode. capabilities —
@@ -320,6 +321,7 @@ def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
         use_hashtags=getattr(profile, "use_hashtags", False),
         avg_post_length=profile.avg_post_length,
         content_mode=getattr(profile, "content_mode", None) or "topic",
+        image_mode=getattr(profile, "image_mode", None) or "ai",
         active=profile.active,
         created_at=profile.created_at.isoformat() if profile.created_at else None,
         owner_id=profile.owner_id,
@@ -442,6 +444,7 @@ class ProfileUpdateRequest(BaseModel):
     use_emoji: Optional[bool] = None
     use_hashtags: Optional[bool] = None
     content_mode: Optional[str] = None
+    image_mode: Optional[str] = None  # "ai" | "stock"
     active: Optional[bool] = None
     # Стиль/рубрика контента (topic-режим). post_template — шаблон/рубрика поста
     # (напр. «ТОП-5 фактов о стране»), движок следует ему дословно.
@@ -880,6 +883,8 @@ async def update_profile(
         raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
     if "schedule_mode" in update_data and update_data["schedule_mode"] not in ("off", "frequency", "times"):
         raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency' or 'times'")
+    if "image_mode" in update_data and update_data["image_mode"] not in ("ai", "stock"):
+        raise HTTPException(status_code=422, detail="image_mode must be 'ai' or 'stock'")
 
     _enforce_profile_tier(principal, profile.subscription_tier, update_data)
 
