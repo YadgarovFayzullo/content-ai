@@ -276,6 +276,8 @@ class TenantProfileSchema(BaseModel):
     writing_style: Optional[str]
     audience: Optional[str]
     topics: Optional[str]
+    post_template: Optional[str] = None
+    cta: Optional[str] = None
     creativity_level: float
     factual_strictness: float
     use_rag: bool
@@ -306,6 +308,8 @@ def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
         writing_style=profile.writing_style,
         audience=profile.audience,
         topics=profile.topics,
+        post_template=getattr(profile, "post_template", None),
+        cta=getattr(profile, "cta", None),
         creativity_level=profile.creativity_level,
         factual_strictness=profile.factual_strictness,
         use_rag=profile.use_rag,
@@ -433,6 +437,13 @@ class ProfileUpdateRequest(BaseModel):
     use_rag: Optional[bool] = None
     content_mode: Optional[str] = None
     active: Optional[bool] = None
+    # Стиль/рубрика контента (topic-режим). post_template — шаблон/рубрика поста
+    # (напр. «ТОП-5 фактов о стране»), движок следует ему дословно.
+    writing_style: Optional[str] = None
+    post_template: Optional[str] = None
+    cta: Optional[str] = None
+    language: Optional[str] = None
+    audience: Optional[str] = None
     # Авто-расписание (гейтится тарифом: scheduling + max_posts_per_day).
     schedule_mode: Optional[str] = None  # "off" | "frequency" | "times"
     posts_per_day: Optional[int] = None
