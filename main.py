@@ -21,8 +21,9 @@ from bot.dialogs import (
     settings_dialog,
     settings_entry_router,
 )
-from bot.scheduler import schedule_tick, reindex_references
+from bot.scheduler import schedule_tick, reindex_references, TZ
 from bot.metrics import collect_metrics
+from bot.weekly_review import post_weekly_reviews
 from bot.internal_api import start_internal_api
 from bot.system_watch import system_watch, system_digest
 from bot import rag_client
@@ -96,6 +97,12 @@ async def main():
     # дайджест — сводка по контейнерам/ресурсам в 9:00.
     scheduler.add_job(system_watch, "interval", minutes=2, args=[bot])
     scheduler.add_job(system_digest, "cron", hour=9, minute=5, args=[bot])
+    # Обзор недели для repost-каналов: раз в неделю (вс 20:00 по TZ канала) в каждый
+    # канал-агрегатор публикуется дайджест заголовков постов недели со ссылками.
+    scheduler.add_job(
+        post_weekly_reviews, "cron", day_of_week="sun", hour=20, minute=0,
+        timezone=TZ, args=[bot],
+    )
     scheduler.start()
     # Внутренний HTTP-API для admin-api (publish / publish-all / collect-metrics):
     # бот — единственный владелец aiogram-Bot и Telethon-сессии.

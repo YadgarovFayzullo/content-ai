@@ -668,6 +668,30 @@ def save_post(post: PostHistory) -> PostHistory:
         return post
 
 
+def get_published_posts_since(
+    tenant_id: str,
+    since: datetime,
+    exclude_topics: Optional[List[str]] = None,
+) -> List[PostHistory]:
+    """Опубликованные посты арендатора с message_id, созданные не раньше `since`,
+    по возрастанию даты. Для еженедельного «обзора недели»: только реальные посты
+    канала (есть message_id). exclude_topics — темы, исключаемые из выборки
+    (напр. сами обзоры недели), чтобы дайджест не ссылался сам на себя.
+    """
+    with Session(engine, expire_on_commit=False) as session:
+        stmt = (
+            select(PostHistory)
+            .where(PostHistory.tenant_id == tenant_id)
+            .where(PostHistory.posted == True)  # noqa: E712
+            .where(PostHistory.message_id.is_not(None))
+            .where(PostHistory.created_at >= since)
+            .order_by(PostHistory.created_at)
+        )
+        if exclude_topics:
+            stmt = stmt.where(PostHistory.topic.not_in(exclude_topics))
+        return list(session.exec(stmt).all())
+
+
 def get_reposted_source_keys(tenant_id: str) -> set[str]:
     """Ключи "source_chat_id:source_message_id" уже опубликованных репостов канала.
 
