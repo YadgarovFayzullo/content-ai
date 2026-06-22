@@ -1,0 +1,58 @@
+name: Deploy to server
+
+# CD: при пуше в main заходим по SSH на EC2, подтягиваем код и пересобираем
+# только сборочные сервисы (bot, admin-api). db/nginx/certbot — готовые образы,
+# их не трогаем. .env на сервере не в git (gitignored) и переживает reset.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - ".github/workflows/**"
+  workflow_dispatch: {}
+
+# Не допускаем параллельных деплоев на один и тот же сервер.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            cd /home/ubuntu/content-ai
+
+            echo "::group::Pull latest main"
+            git fetch --all --prune
+            git reset --hard origin/main
+            git log --oneline -1
+            echo "::endgroup::"
+
+            # Сборка по одному образу: бокс маленький (1.9G RAM + 2G swap),
+            # параллельная сборка двух образов рискует словить OOM.
+            echo "::group::Build images (sequential)"
+            docker compose build bot
+            docker compose build admin-api
+            echo "::endgroup::"
+
+            echo "::group::Recreate services"
+            docker compose up -d
+            echo "::endgroup::"
+
+            echo "::group::Cleanup dangling images"
+            docker image prune -f
+            echo "::endgroup::"
+
+            echo "::group::Status"
+            docker compose ps
+            echo "::endgroup::"
