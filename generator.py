@@ -531,12 +531,31 @@ def _strip_lead_subject(desc: str, stems: list[str]) -> tuple[str, bool]:
     return rest, True
 
 
+def _repeated_opening_stems(text: str) -> set[str]:
+    """Стемы слов, которыми РЕАЛЬНО начинаются (после необязат. предлога) ≥2 описаний
+    пунктов. Ловит повтор имени, даже если модель сузила тему (город вместо страны):
+    ctx.topic='Новая Зеландия', а пункты начинаются с 'Окленд' — здесь добавится
+    стем 'окл', и зачин срежется."""
+    firsts = []
+    for it in _LIST_ITEM_RE.findall(text):
+        s = re.sub(r"<[^>]+>", "", it)
+        if ": " in s:
+            s = s.split(": ", 1)[1]
+        toks = _WORD_RE.findall(s)
+        if toks and toks[0].lower() in _PREPOS and len(toks) > 1:
+            toks = toks[1:]
+        if toks and len(toks[0]) >= 4:
+            firsts.append(toks[0][: max(3, len(toks[0]) - 3)].lower())
+    return {s for s, c in Counter(firsts).items() if c >= 2}
+
+
 def _strip_repeated_subject(text: str, subject: str) -> str:
-    """Детерминированно убирает повторяющийся зачин-название темы в начале ОПИСАНИЙ
+    """Детерминированно убирает повторяющийся зачин-название в начале ОПИСАНИЙ
     пунктов. Слабая модель (любая) под шаблоном «<Метка>: <описание>» упорно
     начинает описание с названия темы; промпт/ретраи это не лечат до конца. Срезаем
-    только когда тема стоит в начале ≥2 пунктов (иначе это не повтор)."""
-    stems = _subject_stems(subject)
+    только когда имя стоит в начале ≥2 пунктов (иначе это не повтор). Имя берём и из
+    ctx.topic, и эмпирически из самого текста (на случай сужения темы моделью)."""
+    stems = set(_subject_stems(subject)) | _repeated_opening_stems(text)
     if not stems:
         return text
     lines = text.split("\n")
@@ -616,10 +635,10 @@ def generate_post(ctx: GenerationContext) -> str:
                     break
             post = best_post
 
-            # Финальная гарантия: даже если модель так и не перестала начинать
-            # пункты с названия темы — срезаем его программно (модель-независимо).
-            if _has_repetitive_openings(post):
-                post = _strip_repeated_subject(post, ctx.topic)
+        # Финальная гарантия (всегда): если имя темы ведёт ≥2 пункта — срезаем его
+        # программно, модель-независимо. Вне ретрай-блока: чистим зачины-имена даже
+        # когда первые СЛОВА формально разные ('Новую…' / 'В Новой…') и score<2.
+        post = _strip_repeated_subject(post, ctx.topic)
 
         return post
     except Exception as e:
