@@ -23,6 +23,9 @@ COPY context_builder.py .
 COPY rag.py .
 COPY generator.py .
 COPY orchestrator.py .
+# Stock-photo fetch (Pexels). orchestrator imports it at module load, so it must
+# be present even for the text-only preview path (deps: httpx + PEXELS_API_KEY).
+COPY image_search.py .
 
 # Expose port
 EXPOSE 8001
