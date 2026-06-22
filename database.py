@@ -183,6 +183,21 @@ class PostMetric(SQLModel, table=True):
     captured_at: datetime = Field(default_factory=_utcnow)
 
 
+class ChannelStat(SQLModel, table=True):
+    """Снимок числа подписчиков канала (на момент captured_at).
+
+    Канал-уровневая метрика (в отличие от PostMetric — по посту). Несколько строк
+    на канал = история роста аудитории во времени; дельту считаем по двум последним.
+    """
+
+    __tablename__ = "channel_stats"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(index=True)
+    subscribers: int = 0
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
 class RepostStory(SQLModel, table=True):
     """Опубликованная «история» repost-режима (V2): кластер постов-источников об
     одном событии, сведённый в один канонический пост.
@@ -1011,6 +1026,12 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
     счёт). Если метрик ещё нет, пост учитывается с нулевыми просмотрами.
     """
     since = _utcnow() - timedelta(days=days)
+    subs = get_channel_subscribers(tenant_id)  # последний снимок подписчиков (или None)
+    subs_summary = {
+        "subscribers": subs["subscribers"] if subs else None,
+        "subscribers_at": subs["captured_at"] if subs else None,
+        "subscribers_delta": subs["delta"] if subs else None,
+    }
     empty = {
         "summary": {
             "total_published": 0,
@@ -1020,6 +1041,7 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
             "avg_views_per_post": 0,
             "avg_forwards_per_post": 0,
             "avg_reactions_per_post": 0,
+            **subs_summary,
         },
         "recent_posts": [],
         "by_topic": [],
@@ -1108,6 +1130,7 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
                 "avg_views_per_post": round(total_views / n),
                 "avg_forwards_per_post": round(total_forwards / n),
                 "avg_reactions_per_post": round(total_reactions / n),
+                **subs_summary,
             },
             "recent_posts": recent_posts,
             "by_topic": by_topic,
@@ -1135,3 +1158,36 @@ def save_metric(
         session.commit()
         session.refresh(metric)
         return metric
+
+
+def save_channel_stat(tenant_id: str, subscribers: int) -> ChannelStat:
+    """Сохраняет снимок числа подписчиков канала."""
+    with Session(engine, expire_on_commit=False) as session:
+        stat = ChannelStat(tenant_id=tenant_id, subscribers=subscribers)
+        session.add(stat)
+        session.commit()
+        session.refresh(stat)
+        return stat
+
+
+def get_channel_subscribers(tenant_id: str) -> Optional[dict]:
+    """Последний снимок подписчиков + дельта к предыдущему. None, если замеров нет.
+
+    Возвращает {"subscribers", "captured_at", "delta"} — delta = разница с
+    предыдущим снимком (None, если он один)."""
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(ChannelStat)
+            .where(ChannelStat.tenant_id == tenant_id)
+            .order_by(ChannelStat.captured_at.desc())
+            .limit(2)
+        ).all()
+        if not rows:
+            return None
+        latest = rows[0]
+        delta = latest.subscribers - rows[1].subscribers if len(rows) > 1 else None
+        return {
+            "subscribers": latest.subscribers,
+            "captured_at": latest.captured_at.isoformat() if latest.captured_at else None,
+            "delta": delta,
+        }

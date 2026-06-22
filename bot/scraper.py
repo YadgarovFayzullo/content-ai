@@ -51,6 +51,23 @@ async def _get_client() -> TelegramClient:
     return _client
 
 
+async def get_subscriber_count(chat_id: Any) -> Optional[int]:
+    """Число подписчиков канала через MTProto (Bot API его не отдаёт). None при
+    недоступности (нет сессии / приватный канал без доступа / ошибка)."""
+    if not _creds_ready():
+        return None
+    try:
+        from telethon.tl.functions.channels import GetFullChannelRequest
+
+        client = await _get_client()
+        entity = await client.get_entity(_peer(chat_id))
+        full = await client(GetFullChannelRequest(channel=entity))
+        return int(getattr(full.full_chat, "participants_count", 0) or 0)
+    except Exception as e:
+        logging.warning("Obunachilar sonini olishda xato (%s): %s", chat_id, e)
+        return None
+
+
 async def scrape_channel_history(
     chat_id: str, limit: int = 200
 ) -> list[dict[str, Any]]:

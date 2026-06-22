@@ -12,8 +12,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from database import get_posts_for_metrics, get_tenant_profile, save_metric
-from bot.scraper import _creds_ready, _get_client, _peer
+from database import (
+    get_active_tenants,
+    get_posts_for_metrics,
+    get_tenant_profile,
+    save_channel_stat,
+    save_metric,
+)
+from bot.scraper import _creds_ready, _get_client, _peer, get_subscriber_count
 
 # Окно сбора: посты старше уже стабилизировались, их не переснимаем.
 METRICS_WINDOW_DAYS = 7
@@ -26,11 +32,38 @@ def _count_reactions(msg) -> int:
     return sum(r.count for r in reactions.results)
 
 
+async def collect_subscriber_counts() -> int:
+    """Снимок числа подписчиков по всем активным каналам. Возвращает число сохранённых
+    замеров. Канал-уровневая метрика (не привязана к постам), поэтому отдельный проход
+    по арендаторам — снимаем даже у каналов без свежих постов."""
+    if not _creds_ready():
+        return 0
+    tenants = await asyncio.to_thread(get_active_tenants)
+    saved = 0
+    for profile in tenants:
+        try:
+            count = await get_subscriber_count(profile.chat_id)
+            if count is None:
+                continue
+            await asyncio.to_thread(save_channel_stat, profile.tenant_id, count)
+            saved += 1
+        except Exception as e:
+            logging.error("Obunachilar xatosi (%s): %s", profile.chat_id, e)
+    logging.info("Obunachilar soni yig'ildi: %d ta kanal.", saved)
+    return saved
+
+
 async def collect_metrics() -> int:
-    """Снимает метрики свежих постов всех арендаторов. Возвращает число замеров."""
+    """Снимает метрики свежих постов всех арендаторов. Возвращает число замеров.
+
+    Заодно снимает число подписчиков всех активных каналов (канал-уровневая метрика),
+    чтобы и cron, и ручная кнопка «собрать метрики» обновляли аудиторию тоже."""
     if not _creds_ready():
         logging.warning("Telethon sozlanmagan — metrikalar yig'ilmadi.")
         return 0
+
+    # Подписчиков снимаем всегда (даже если свежих постов нет).
+    await collect_subscriber_counts()
 
     since = datetime.now(timezone.utc) - timedelta(days=METRICS_WINDOW_DAYS)
     posts = await asyncio.to_thread(get_posts_for_metrics, since)
