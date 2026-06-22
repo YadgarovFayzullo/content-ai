@@ -272,8 +272,12 @@ LIST / BULLET VARIETY (critical)
   Do NOT begin items with the same word, the same grammatical pattern, or the
   topic/place name. FORBIDDEN: every bullet starting with "<Place> — город, где..."
   / "<Place> — город, который..." / "<Place> is a city where..." / "<Place> has...".
-- Do NOT restate the subject's name at the start of each item — it is already the
-  post's topic; repeating "Дубай — ..." / "Сингапур — ..." in every bullet is banned.
+- Do NOT use the post's topic/subject name inside list items AT ALL — neither at
+  the start nor in the middle. The subject is already in the title/intro, so inside
+  a bullet it is redundant. FORBIDDEN in every item: "Новая Зеландия — ...",
+  "В Новой Зеландии ...", "Дубай имеет ...". Write the bullet's content directly
+  ("Фьорды тянутся на километры...", "Население — около 5 млн...") without naming
+  the country/subject again.
 - The label before a colon must NOT be echoed right after it. FORBIDDEN:
   "Пляжи Дубая: Дубай имеет множество пляжей...", "Тайская кухня: Бангкок — город,
   где можно насладиться тайской кухней...". Instead continue with NEW information:
@@ -488,6 +492,73 @@ def _has_repetitive_openings(text: str) -> bool:
     return _repetition_score(text) >= 2
 
 
+# Предлоги, которые могут стоять перед названием темы в начале пункта
+# («В Новой Зеландии…», «На Гавайях…») — пропускаем их при срезе.
+_PREPOS = {"в", "во", "на", "из", "о", "об", "у", "к", "с", "со"}
+
+
+def _subject_stems(subject: str) -> list[str]:
+    """Стемы значимых слов темы для матча склонённых форм («Новая Зеландия» →
+    ['нов','зелан', сматчит 'Новой Зеландии', 'Новая Зеландия', 'Новозеландский').
+    Грубое усечение хвоста (len-3, минимум 3 буквы) — морфоанализатора нет, но для
+    отсечения зачина-названия этого достаточно."""
+    return [
+        w[: max(3, len(w) - 3)].lower()
+        for w in _WORD_RE.findall(subject or "")
+        if len(w) >= 4
+    ]
+
+
+def _strip_lead_subject(desc: str, stems: list[str]) -> tuple[str, bool]:
+    """Срезает в начале описания зачин-название темы: [предлог] + подряд идущие
+    слова-формы темы (по стему) + хвостовой разделитель, и поднимает заглавную.
+    «В Новой Зеландии находится X» → «Находится X»; «Дубай - город…» → «Город…».
+    Возвращает (новый_текст, изменилось)."""
+    toks = list(_WORD_RE.finditer(desc))
+    if not toks:
+        return desc, False
+    i = 1 if toks[0].group(0).lower() in _PREPOS else 0
+    j = i
+    while j < len(toks) and any(toks[j].group(0).lower().startswith(s) for s in stems):
+        j += 1
+    if j == i:  # ни одного слова темы в зачине — не трогаем
+        return desc, False
+    rest = re.sub(r"^\s*[-–—:,]?\s*", "", desc[toks[j - 1].end():])
+    m = re.search(r"[A-Za-zА-Яа-яЁё]", rest)
+    if m:
+        k = m.start()
+        rest = rest[:k] + rest[k].upper() + rest[k + 1:]
+    return rest, True
+
+
+def _strip_repeated_subject(text: str, subject: str) -> str:
+    """Детерминированно убирает повторяющийся зачин-название темы в начале ОПИСАНИЙ
+    пунктов. Слабая модель (любая) под шаблоном «<Метка>: <описание>» упорно
+    начинает описание с названия темы; промпт/ретраи это не лечат до конца. Срезаем
+    только когда тема стоит в начале ≥2 пунктов (иначе это не повтор)."""
+    stems = _subject_stems(subject)
+    if not stems:
+        return text
+    lines = text.split("\n")
+    cand = []
+    for idx, line in enumerate(lines):
+        m = _LIST_ITEM_RE.match(line)
+        if not m:
+            continue
+        body = m.group(1)
+        label, desc = body.split(": ", 1) if ": " in body else ("", body)
+        new_desc, changed = _strip_lead_subject(desc, stems)
+        if changed:
+            cand.append((idx, line, body, label, new_desc))
+    if len(cand) < 2:
+        return text
+    for idx, line, body, label, new_desc in cand:
+        new_body = f"{label}: {new_desc}" if label else new_desc
+        prefix = line[: line.index(body)] if body in line else ""
+        lines[idx] = prefix + new_body
+    return "\n".join(lines)
+
+
 def generate_post(ctx: GenerationContext) -> str:
     """Генерирует готовый текст поста. Бросает RuntimeError при сбое."""
     user_context = _build_user_context(ctx)
@@ -544,6 +615,11 @@ def generate_post(ctx: GenerationContext) -> str:
                 if score < 2:  # правило выполнено — дальше не пробуем
                     break
             post = best_post
+
+            # Финальная гарантия: даже если модель так и не перестала начинать
+            # пункты с названия темы — срезаем его программно (модель-независимо).
+            if _has_repetitive_openings(post):
+                post = _strip_repeated_subject(post, ctx.topic)
 
         return post
     except Exception as e:
