@@ -443,28 +443,49 @@ _LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•·])\s+(.+)$")
 _WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ’ʼ']+")
 
 
-def _item_opening(item: str) -> str:
-    """Сигнатура «как начинается» пункт: первое слово ОПИСАНИЯ (после метки-двоеточия),
-    без эмодзи/HTML/пунктуации, в нижнем регистре. «🛍️ <b>Рынки</b>: Дубай - город…»
-    → «дубай»."""
+def _item_openings(item: str) -> tuple[str, str]:
+    """Сигнатуры «как начинается» пункт: (первое слово, первые два слова) ОПИСАНИЯ
+    (после метки-двоеточия), без эмодзи/HTML/пунктуации, в нижнем регистре.
+    «🛍️ <b>Рынки</b>: Дубай - город…» → ("дубай", "дубай город"). Два слова ловят
+    шаблон, где первое слово разное, а конструкция одна («…страна, где можно найти»)."""
     s = re.sub(r"<[^>]+>", "", item)          # убрать HTML-теги
     if ":" in s:                              # отбросить метку «Рынки:» перед двоеточием
         s = s.split(":", 1)[1]
-    m = _WORD_RE.search(s)
-    return m.group(0).lower() if m else ""
+    words = [w.lower() for w in _WORD_RE.findall(s)]
+    if not words:
+        return "", ""
+    one = words[0]
+    two = " ".join(words[:2]) if len(words) >= 2 else one
+    return one, two
+
+
+def _repetition_score(text: str) -> int:
+    """Насколько одинаково начинаются пункты: максимум среди «сколько пунктов делят
+    одно первое слово» и «…одни первые два слова». ≥2 = есть повтор. 0, если пунктов
+    мало (<3) — не дёргаем ретрай зря."""
+    items = _LIST_ITEM_RE.findall(text)
+    if len(items) < 3:
+        return 0
+    ones, twos = [], []
+    for it in items:
+        o, t = _item_openings(it)
+        if o:
+            ones.append(o)
+        if t:
+            twos.append(t)
+    if len(ones) < 3:
+        return 0
+    best = Counter(ones).most_common(1)[0][1]
+    if twos:
+        best = max(best, Counter(twos).most_common(1)[0][1])
+    return best
 
 
 def _has_repetitive_openings(text: str) -> bool:
-    """True, если ≥2 пунктов списка начинаются одинаково (одно и то же первое слово
-    описания) — типичная болезнь слабой модели: «<Город> — город, где…» в каждом
-    пункте. Срабатывает только при ≥3 пунктах, чтобы не дёргать ретрай зря."""
-    items = _LIST_ITEM_RE.findall(text)
-    if len(items) < 3:
-        return False
-    sigs = [o for o in (_item_opening(i) for i in items) if o]
-    if len(sigs) < 3:
-        return False
-    return Counter(sigs).most_common(1)[0][1] >= 2
+    """True, если ≥2 пунктов списка начинаются одинаково (по первому слову ИЛИ по
+    первым двум словам) — болезнь слабой модели: «<Город> — город, где…» в каждом
+    пункте. Срабатывает только при ≥3 пунктах."""
+    return _repetition_score(text) >= 2
 
 
 def generate_post(ctx: GenerationContext) -> str:
@@ -485,30 +506,44 @@ def generate_post(ctx: GenerationContext) -> str:
             raise RuntimeError("LLM bo'sh javob qaytardi")
         post = _sanitize_post(text, ctx)
 
-        # Анти-шаблон: если пункты начинаются одинаково — одна корректирующая
-        # перегенерация с явным указанием на провал. Мягкое правило в SYSTEM_PROMPT
-        # слабая модель часто игнорирует; программная проверка добивает гарантированно.
+        # Анти-шаблон: если пункты начинаются одинаково — корректирующие
+        # перегенерации. Мягкое правило в SYSTEM_PROMPT тонет в большом промпте, и
+        # слабая модель его игнорит; здесь директиву ставим В НАЧАЛО user-промпта
+        # (самое заметное место), повышаем температуру и пробуем до 3 раз. Берём
+        # наименее повторяющийся вариант, даже если идеала нет — никогда не вернём
+        # хуже исходного.
         if _has_repetitive_openings(post):
-            stricter = user_context + (
-                "\n\n## STRICT RETRY (your previous output failed the LIST VARIETY rule)\n"
-                "In your previous attempt MULTIPLE list items started the SAME way "
-                "(repeating the place/topic name, e.g. '<Place> — город, где...'). "
-                "Rewrite AGAIN. EVERY list item MUST begin with a DIFFERENT first word "
-                "and a different structure. Do NOT restate the subject's name at the "
-                "start of any item, and do NOT echo the label before the colon after it."
+            directive = (
+                "## LIST VARIETY — HARD REQUIREMENT (read this FIRST)\n"
+                "A previous attempt FAILED this rule: multiple list items began the "
+                "SAME way — repeating the topic/place name ('<Place> - страна, где...') "
+                "or the same construction in every item. Rewrite the WHOLE post so that "
+                "EVERY list item starts with a DIFFERENT first word AND a different "
+                "structure: make one open with a number/fact, one with a verb, one with "
+                "a concrete noun, one with an adjective. NEVER restate the subject's "
+                "name at the start of an item, and NEVER echo the label before the "
+                "colon right after it.\n\n"
             )
-            try:
-                retry = groq_chat(
-                    SYSTEM_PROMPT,
-                    stricter,
-                    temperature=min(1.0, temperature + 0.1),
-                    history=history,
-                ).strip()
+            best_post, best_score = post, _repetition_score(post)
+            for attempt in range(3):
+                try:
+                    retry = groq_chat(
+                        SYSTEM_PROMPT,
+                        directive + user_context,
+                        temperature=min(1.0, temperature + 0.15 * (attempt + 1)),
+                        history=history,
+                    ).strip()
+                except Exception:
+                    break  # сбой ретрая — оставляем лучшее найденное, пост важнее
                 retry_post = _sanitize_post(retry, ctx) if retry else ""
-                if retry_post and not _has_repetitive_openings(retry_post):
-                    post = retry_post
-            except Exception:
-                pass  # сбой ретрая — оставляем первый вариант, пост важнее
+                if not retry_post:
+                    continue
+                score = _repetition_score(retry_post)
+                if score < best_score:
+                    best_post, best_score = retry_post, score
+                if score < 2:  # правило выполнено — дальше не пробуем
+                    break
+            post = best_post
 
         return post
     except Exception as e:
