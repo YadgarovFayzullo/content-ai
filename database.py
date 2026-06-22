@@ -1031,6 +1031,7 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
         "subscribers": subs["subscribers"] if subs else None,
         "subscribers_at": subs["captured_at"] if subs else None,
         "subscribers_delta": subs["delta"] if subs else None,
+        "subscribers_series": get_channel_subscriber_series(tenant_id),
     }
     empty = {
         "summary": {
@@ -1191,3 +1192,15 @@ def get_channel_subscribers(tenant_id: str) -> Optional[dict]:
             "captured_at": latest.captured_at.isoformat() if latest.captured_at else None,
             "delta": delta,
         }
+
+
+def get_channel_subscriber_series(tenant_id: str, limit: int = 30) -> List[int]:
+    """Последние `limit` снимков подписчиков (oldest→newest) — для спарклайна роста."""
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(ChannelStat)
+            .where(ChannelStat.tenant_id == tenant_id)
+            .order_by(ChannelStat.captured_at.desc())
+            .limit(limit)
+        ).all()
+        return [r.subscribers for r in reversed(rows)]
