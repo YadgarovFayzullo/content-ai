@@ -11,3 +11,4 @@ gen_images/
 # Let's Encrypt cert material + ACME webroot (generated on the host, never commit)
 nginx/letsencrypt/
 nginx/www/
+docker-compose.override.yml
