@@ -264,6 +264,11 @@ if database_url.startswith("postgresql"):
 # что удобно при возврате ORM-моделей из функций доступа.
 engine = create_engine(database_url, **_engine_kwargs)
 
+# Семантический-«лайт» дедуп истории постов опирается на pg_trgm (только Postgres).
+# На SQLite (локальная разработка) функции дедупа деградируют до подстрочного
+# фолбэка — продакшен всегда Postgres.
+_IS_PG = database_url.startswith("postgresql")
+
 
 # Колонки, добавленные после первого релиза. create_all() новые таблицы создаёт,
 # но колонки в существующие НЕ досыпает — поэтому добавляем их вручную, идемпотентно.
@@ -308,9 +313,34 @@ def _run_migrations() -> None:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
 
+def _ensure_trgm_dedup() -> None:
+    """Включает pg_trgm и триграммные GIN-индексы по теме/контенту постов.
+
+    Нужно для дедупа перед генерацией (находим, что уже опубликовано). Идемпотентно;
+    только Postgres. Индексы держат similarity()-поиск быстрым при росте истории.
+    """
+    if not _IS_PG:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_posts_history_topic_trgm "
+                "ON posts_history USING gin (topic gin_trgm_ops)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_posts_history_content_trgm "
+                "ON posts_history USING gin (content gin_trgm_ops)"
+            )
+        )
+
+
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)  # создаёт недостающие таблицы (вкл. post_metrics)
     _run_migrations()                      # досыпает новые колонки в старые таблицы
+    _ensure_trgm_dedup()                   # pg_trgm + индексы для дедупа перед генерацией
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +688,87 @@ def get_recent_posts(tenant_id: str, limit: int = 5) -> List[PostHistory]:
                 .limit(limit)
             ).all()
         )
+
+
+# --- Дедуп перед генерацией (что уже опубликовано) ----------------------------
+# Цель: до генерации пройтись по постам тенанта, понять, что уже освещено, и не
+# повторяться. Слой similarity намеренно изолирован в find_similar_posts(): сейчас
+# это pg_trgm (бесплатно, без модели), позже без смены вызывающего кода заменяется
+# на векторный поиск (pgvector + эмбеддинги).
+
+
+def _norm_topic(t: Optional[str]) -> str:
+    """Нормализует тему для сравнения: схлопывает пробелы и приводит к нижнему регистру."""
+    return " ".join((t or "").split()).lower()
+
+
+def get_recent_post_topics(tenant_id: str, limit: int = 20) -> List[str]:
+    """Нормализованные темы последних постов тенанта (новые→старые, с повторами).
+
+    Порядок сохраняется: вызывающий по индексу определяет «давность» темы для
+    выбора наименее недавно использованной (LRU-ротация тем)."""
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(PostHistory.topic)
+            .where(PostHistory.tenant_id == tenant_id)
+            .order_by(PostHistory.created_at.desc())
+            .limit(limit)
+        ).all()
+    return [_norm_topic(t) for t in rows if t]
+
+
+def find_similar_posts(
+    tenant_id: str, query: str, limit: int = 3, min_sim: float = 0.45
+) -> List[dict]:
+    """Прошлые посты тенанта, наиболее похожие на `query` (обычно — тему).
+
+    Возвращает [{"content","topic","score"}] по убыванию score (0..1). На Postgres —
+    триграммная схожесть pg_trgm по теме (основной сигнал) и началу контента; на
+    SQLite — грубый фолбэк по совпадению нормализованной темы. Пусто, если ничего
+    не превышает min_sim. Это «что уже опубликовано» для анти-повтора в промпте."""
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    if _IS_PG:
+        sql = text(
+            """
+            SELECT content, topic,
+                   GREATEST(
+                       similarity(coalesce(topic, ''), :q),
+                       similarity(left(content, 400), :q)
+                   ) AS score
+            FROM posts_history
+            WHERE tenant_id = :tid
+            ORDER BY score DESC
+            LIMIT :lim
+            """
+        )
+        with engine.begin() as conn:
+            rows = conn.execute(
+                sql, {"q": q, "tid": tenant_id, "lim": limit}
+            ).all()
+        return [
+            {"content": r[0], "topic": r[1], "score": float(r[2])}
+            for r in rows
+            if r[2] is not None and float(r[2]) >= min_sim
+        ]
+
+    # SQLite-фолбэк: совпадение по нормализованной теме (без триграмм).
+    nq = _norm_topic(q)
+    with Session(engine, expire_on_commit=False) as session:
+        recent = session.exec(
+            select(PostHistory)
+            .where(PostHistory.tenant_id == tenant_id)
+            .order_by(PostHistory.created_at.desc())
+            .limit(50)
+        ).all()
+    out = [
+        {"content": p.content, "topic": p.topic, "score": 1.0}
+        for p in recent
+        if _norm_topic(p.topic) == nq
+    ]
+    return out[:limit]
 
 
 def save_post(post: PostHistory) -> PostHistory:

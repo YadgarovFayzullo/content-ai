@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -266,6 +267,21 @@ DEPTH
 - A post is substance, not a hype slogan. Write 2–4 short paragraphs of real,
   useful content (an insight, explanation or takeaway), not one promotional line.
 
+LIST / BULLET VARIETY (critical)
+- When the post has a numbered or bulleted list, EVERY item MUST open differently.
+  Do NOT begin items with the same word, the same grammatical pattern, or the
+  topic/place name. FORBIDDEN: every bullet starting with "<Place> — город, где..."
+  / "<Place> — город, который..." / "<Place> is a city where..." / "<Place> has...".
+- Do NOT restate the subject's name at the start of each item — it is already the
+  post's topic; repeating "Дубай — ..." / "Сингапур — ..." in every bullet is banned.
+- The label before a colon must NOT be echoed right after it. FORBIDDEN:
+  "Пляжи Дубая: Дубай имеет множество пляжей...", "Тайская кухня: Бангкок — город,
+  где можно насладиться тайской кухней...". Instead continue with NEW information:
+  "Пляжи Дубая: золотистый песок Джумейры тянется на километры вдоль залива."
+- Vary the opening of each item: start one with a vivid fact or number, one with a
+  verb, one with a concrete noun, one with an adjective. Across the whole post the
+  item openings must be visibly different from one another.
+
 CHANNEL NAME / GREETINGS (critical)
 - `channel_name` is INTERNAL metadata. NEVER write it into the post and NEVER
   address the audience by it. Do not start with greetings like "Salom, <channel>!"
@@ -369,6 +385,19 @@ def _build_user_context(ctx: GenerationContext) -> str:
             "## TOPIC",
             ctx.topic,
             "",
+            # Дедуп перед генерацией: посты тенанта по ТОЙ ЖЕ теме, уже опубликованные.
+            # Сильнее общего ANTI-REPEAT — это конкретно «ты уже писал ПРО ЭТО».
+            (
+                "## ALREADY PUBLISHED ON THIS SUBJECT (critical — do NOT repeat)\n"
+                "The channel has ALREADY published the post(s) below on essentially this "
+                "same subject. Do NOT restate their facts, structure, examples or wording. "
+                "Take a clearly NEW angle / sub-topic, or add genuinely fresh information "
+                "not present below:\n"
+                + _format_recent(ctx.already_published, limit=3)
+                + "\n"
+                if getattr(ctx, "already_published", None)
+                else ""
+            ),
             "## RAG CONTEXT",
             ctx.rag_context or "(none — rely on general knowledge)",
             "",
@@ -409,6 +438,35 @@ def _recent_as_turns(recent: List[str], limit: int = 6) -> List[dict]:
     return turns
 
 
+# Пункт списка: «1. …», «- …», «• …». Захватываем содержимое пункта.
+_LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•·])\s+(.+)$")
+_WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёЎўҚқҒғҲҳ’ʼ']+")
+
+
+def _item_opening(item: str) -> str:
+    """Сигнатура «как начинается» пункт: первое слово ОПИСАНИЯ (после метки-двоеточия),
+    без эмодзи/HTML/пунктуации, в нижнем регистре. «🛍️ <b>Рынки</b>: Дубай - город…»
+    → «дубай»."""
+    s = re.sub(r"<[^>]+>", "", item)          # убрать HTML-теги
+    if ":" in s:                              # отбросить метку «Рынки:» перед двоеточием
+        s = s.split(":", 1)[1]
+    m = _WORD_RE.search(s)
+    return m.group(0).lower() if m else ""
+
+
+def _has_repetitive_openings(text: str) -> bool:
+    """True, если ≥2 пунктов списка начинаются одинаково (одно и то же первое слово
+    описания) — типичная болезнь слабой модели: «<Город> — город, где…» в каждом
+    пункте. Срабатывает только при ≥3 пунктах, чтобы не дёргать ретрай зря."""
+    items = _LIST_ITEM_RE.findall(text)
+    if len(items) < 3:
+        return False
+    sigs = [o for o in (_item_opening(i) for i in items) if o]
+    if len(sigs) < 3:
+        return False
+    return Counter(sigs).most_common(1)[0][1] >= 2
+
+
 def generate_post(ctx: GenerationContext) -> str:
     """Генерирует готовый текст поста. Бросает RuntimeError при сбое."""
     user_context = _build_user_context(ctx)
@@ -425,7 +483,34 @@ def generate_post(ctx: GenerationContext) -> str:
         ).strip()
         if not text:
             raise RuntimeError("LLM bo'sh javob qaytardi")
-        return _sanitize_post(text, ctx)
+        post = _sanitize_post(text, ctx)
+
+        # Анти-шаблон: если пункты начинаются одинаково — одна корректирующая
+        # перегенерация с явным указанием на провал. Мягкое правило в SYSTEM_PROMPT
+        # слабая модель часто игнорирует; программная проверка добивает гарантированно.
+        if _has_repetitive_openings(post):
+            stricter = user_context + (
+                "\n\n## STRICT RETRY (your previous output failed the LIST VARIETY rule)\n"
+                "In your previous attempt MULTIPLE list items started the SAME way "
+                "(repeating the place/topic name, e.g. '<Place> — город, где...'). "
+                "Rewrite AGAIN. EVERY list item MUST begin with a DIFFERENT first word "
+                "and a different structure. Do NOT restate the subject's name at the "
+                "start of any item, and do NOT echo the label before the colon after it."
+            )
+            try:
+                retry = groq_chat(
+                    SYSTEM_PROMPT,
+                    stricter,
+                    temperature=min(1.0, temperature + 0.1),
+                    history=history,
+                ).strip()
+                retry_post = _sanitize_post(retry, ctx) if retry else ""
+                if retry_post and not _has_repetitive_openings(retry_post):
+                    post = retry_post
+            except Exception:
+                pass  # сбой ретрая — оставляем первый вариант, пост важнее
+
+        return post
     except Exception as e:
         raise RuntimeError(f"Post yaratib bo'lmadi: {e}")
 

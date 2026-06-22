@@ -488,6 +488,9 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     text: str
     topic: str
+    # Картинка превью как data-URI (base64) по image_mode канала, либо "" если её
+    # не удалось получить (например, AI-режим без бюджета). Фронт показывает как <img src>.
+    image: str = ""
 
 
 class TenantCreateRequest(BaseModel):
@@ -926,7 +929,11 @@ async def generate_post_preview(
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    return GenerateResponse(text=result["text"], topic=result["topic"])
+    return GenerateResponse(
+        text=result["text"],
+        topic=result["topic"],
+        image=result.get("image", ""),
+    )
 
 
 class SuggestTopicsRequest(BaseModel):

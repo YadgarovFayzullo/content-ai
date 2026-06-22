@@ -44,6 +44,10 @@ class GenerationContext:
     # Лучшие по engagement посты канала — образцы «что заходит» (feedback loop).
     top_posts: List[str] = field(default_factory=list)
     rag_context: Optional[str] = None  # заполняется RAG-слоем, если подключён
+    # Прошлые посты тенанта по ТОЙ ЖЕ теме (дедуп перед генерацией): движок обязан
+    # выдать заведомо иной угол, а не пересказать их. Заполняет orchestrator, когда
+    # тема вынужденно повторяется (все темы уже освещены) или запрошена явно.
+    already_published: List[str] = field(default_factory=list)
 
 
 def build_generation_context(
