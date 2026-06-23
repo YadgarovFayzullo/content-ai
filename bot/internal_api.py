@@ -94,9 +94,11 @@ async def handle_publish(request: web.Request) -> web.Response:
                 bot, profile, preview["text"], preview["topic"]
             )
         else:
-            content = await produce_content(profile)
+            # allow_image влияет уже на генерацию: без картинки текст пишется полной
+            # длины (до 4096), а не урезается под лимит подписи к фото.
+            content = await produce_content(profile, with_image=allow_image)
             if not allow_image:
-                # Тариф без image_generation — публикуем только текст.
+                # Подстраховка: тариф без image_generation — публикуем только текст.
                 content["image_path"] = ""
             ok, detail = await send_to_telegram(bot, content, profile.chat_id)
             msg_id = content["entry"].message_id if ok else None

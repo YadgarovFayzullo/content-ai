@@ -133,17 +133,19 @@ def _make_image(profile: TenantProfile, ctx, topic: str, label: str = "") -> str
     return image_path
 
 
-def generate_for_tenant(profile: TenantProfile) -> GeneratedContent:
+def generate_for_tenant(profile: TenantProfile, with_image: bool = True) -> GeneratedContent:
     """Готовит контент для одного арендатора.
 
-    Бросает RuntimeError при сбое генерации. `entry` ещё не сохранён — его
-    сохранит publisher после успешной публикации.
+    with_image — пост уйдёт с картинкой (тогда текст пишем короче, чтобы влезть в
+    подпись к фото). Бросает RuntimeError при сбое генерации. `entry` ещё не
+    сохранён — его сохранит publisher после успешной публикации.
     """
     topic, forced_repeat = pick_topic(profile)
 
     ctx = build_generation_context(profile.tenant_id, topic)
     if ctx is None:
         raise RuntimeError("Tenant profili topilmadi")
+    ctx.with_image = with_image
 
     # Все темы уже освещены (тема вынужденно повторяется) → подаём прошлые посты по
     # этой теме как «уже опубликовано», чтобы движок выдал заведомо другой угол.
@@ -162,7 +164,9 @@ def generate_for_tenant(profile: TenantProfile) -> GeneratedContent:
     post_text = generate_post(ctx)
     buf.append(post_text)
 
-    image_path = _make_image(profile, ctx, topic, label=profile.chat_id)
+    # Без картинки (тариф/ручная публикация её запрещают) не тратим дорогой вызов
+    # генерации изображения — пост уйдёт текстом.
+    image_path = _make_image(profile, ctx, topic, label=profile.chat_id) if with_image else ""
 
     entry = PostHistory(
         tenant_id=profile.tenant_id,

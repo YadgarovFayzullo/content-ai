@@ -31,6 +31,7 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "image_generation": False,  # картинки к постам
         "manual_publish": True,     # кнопка «опубликовать сейчас»
         "analytics": "basic",       # basic — окно ≤ 7 дней, без разбивки по темам
+        "attribution": True,        # подпись бренда в конце поста (бесплатный тариф)
     },
     "pro": {
         "max_channels": 3,
@@ -42,6 +43,7 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "image_generation": True,
         "manual_publish": True,
         "analytics": "full",
+        "attribution": False,       # платные тарифы — без подписи бренда
     },
     "premium": {
         # Конечные потолки (НЕ UNLIMITED) — расходы на LLM/картинки растут с объёмом,
@@ -55,6 +57,7 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "image_generation": True,    # единственная фича сверх pro
         "manual_publish": True,
         "analytics": "full",
+        "attribution": False,
     },
 }
 

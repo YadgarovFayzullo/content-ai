@@ -48,6 +48,9 @@ class GenerationContext:
     # выдать заведомо иной угол, а не пересказать их. Заполняет orchestrator, когда
     # тема вынужденно повторяется (все темы уже освещены) или запрошена явно.
     already_published: List[str] = field(default_factory=list)
+    # Пост уйдёт с картинкой → текст пишем заведомо короче (влезть в подпись к фото,
+    # 1024) и не дать ему обрезаться. Без картинки лимита нет (дефолт Telegram 4096).
+    with_image: bool = True
 
 
 def build_generation_context(

@@ -293,8 +293,11 @@ def _make_entry(profile, text: str, image_path: str, primary: dict) -> PostHisto
     )
 
 
-async def produce_content(profile) -> GeneratedContent:
+async def produce_content(profile, with_image: bool = True) -> GeneratedContent:
     """Единая точка генерации контента для канала — ветвится по content_mode.
+
+    with_image — пост уйдёт с картинкой (тариф/публикация её разрешают). В topic-режиме
+    влияет на длину текста (под лимит подписи к фото) и на то, генерировать ли картинку.
 
     repost — пересборка чужой новости (prepare_repost);
     topic  — оригинальный пост на тему канала (generate_for_tenant).
@@ -308,4 +311,4 @@ async def produce_content(profile) -> GeneratedContent:
                 "postlar yo'q."
             )
         return content
-    return await asyncio.to_thread(generate_for_tenant, profile)
+    return await asyncio.to_thread(generate_for_tenant, profile, with_image)
