@@ -20,6 +20,10 @@ RAG_URL = os.getenv("RAG_URL", "http://localhost:8000")
 
 SCRAPE_HISTORY_LIMIT = int(os.getenv("SCRAPE_HISTORY_LIMIT", "600"))
 
+# Сколько статей максимум тянуть с одной новостной индекс-страницы (сайт-источник).
+# Каждая статья — отдельный HTTP-запрос, поэтому потолок ниже, чем у каналов.
+WEB_MAX_ARTICLES = int(os.getenv("WEB_MAX_ARTICLES", "40"))
+
 DEFAULT_FORBIDDEN_TOPICS = (
     "o'lim, terror, din, ekstremizm, siyosat, urush, narkotik, kasallik, jinoyat, "
     "смерть, террор, религия, политика, война, наркотики, болезнь, преступление"

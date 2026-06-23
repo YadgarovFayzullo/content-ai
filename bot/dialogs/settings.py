@@ -26,7 +26,7 @@ from bot.keyboards import (
     render_settings_card,
     render_sources_text,
 )
-from bot.scraper import scrape_channel_history
+from bot.scraper import scrape_source
 from database import (
     add_tenant_rule,
     add_tenant_source,
@@ -306,17 +306,20 @@ async def on_source_input(
         return await message.answer("Sessiya tugadi. /v2settings bosing.")
 
     source = (message.text or "").strip()
-    if not (source.startswith("@") or source.startswith("-100")):
-        return await message.answer("⚠️ @username yoki -100... yuboring.")
+    is_url = source.startswith("http://") or source.startswith("https://")
+    if not (is_url or source.startswith("@") or source.startswith("-100")):
+        return await message.answer(
+            "⚠️ @username, -100... yoki https://sayt.com yuboring."
+        )
     if source.startswith("@"):
         source = source.lower()
 
     await message.answer(f"📥 <b>{source}</b> o'qilmoqda...")
-    posts = await scrape_channel_history(source, limit=SCRAPE_HISTORY_LIMIT)
+    posts = await scrape_source(source, limit=SCRAPE_HISTORY_LIMIT)
     if not posts:
         return await message.answer(
-            "⚠️ Kanal o'qilmadi (yopiq yoki Telethon sozlanmagan). "
-            "Faqat <b>ochiq</b> kanallar qo'llab-quvvatlanadi."
+            "⚠️ Manba o'qilmadi. Kanal — faqat <b>ochiq</b> (va Telethon sozlangan) "
+            "bo'lsa; sayt — ochiq HTML-sahifa bo'lsa qo'llab-quvvatlanadi."
         )
 
     # Префикс источника в id, чтобы point-id не конфликтовал с постами др. каналов.
@@ -566,8 +569,10 @@ settings_dialog = Dialog(
     ),
     Window(
         Const(
-            "📡 Manba kanal userneymini yuboring (masalan: <code>@tech</code>).\n"
-            "Uning postlari faqat kontekst (faktlar) uchun indekslanadi."
+            "📡 Manba yuboring:\n"
+            "• kanal — <code>@tech</code> yoki <code>-100...</code>\n"
+            "• sayt — <code>https://sayt.com/sahifa</code>\n\n"
+            "Uning matni faqat kontekst (faktlar) uchun indekslanadi."
         ),
         MessageInput(on_source_input, content_types=ContentType.TEXT),
         SwitchTo(Const("🔙 Orqaga"), id="addsrc_back", state=SettingsSG.sources),

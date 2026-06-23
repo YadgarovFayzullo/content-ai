@@ -27,7 +27,7 @@ from database import (
 from orchestrator import generate_preview
 from publisher import send_to_telegram
 from repost import produce_content
-from bot.scheduler import scheduled_job
+from bot.scheduler import index_source, scheduled_job
 from bot.metrics import collect_metrics
 from monitoring import collect_status
 
@@ -139,6 +139,24 @@ async def handle_collect_metrics(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "saved": saved})
 
 
+async def handle_index_source(request: web.Request) -> web.Response:
+    """POST /internal/tenants/{tenant_id}/index-source  Body {source}
+
+    Скрейпит и индексирует ОДИН источник (канал или сайт) в RAG. Бот —
+    единственный владелец Telethon-сессии и RAG-клиента, поэтому admin-api
+    делегирует индексацию сюда (фоном, чтобы добавление источника не ждало
+    сетевого скрейпа). Идемпотентно: повторный вызов апсертит без дублей.
+    """
+    _check_auth(request)
+    tenant_id = request.match_info["tenant_id"]
+    body = await request.json() if request.can_read_body else {}
+    src = (body.get("source") or "").strip()
+    if not src:
+        raise web.HTTPBadRequest(reason="source required")
+    indexed = await index_source(tenant_id, src)
+    return web.json_response({"success": True, "indexed": indexed})
+
+
 async def handle_system_status(request: web.Request) -> web.Response:
     """GET /internal/system-status → снимок здоровья сервера (для админ-панели).
 
@@ -157,6 +175,9 @@ def create_internal_app(bot: Bot) -> web.Application:
         "/internal/tenants/{tenant_id}/publish", handle_publish
     )
     app.router.add_post("/internal/publish-all", handle_publish_all)
+    app.router.add_post(
+        "/internal/tenants/{tenant_id}/index-source", handle_index_source
+    )
     app.router.add_post(
         "/internal/tenants/{tenant_id}/collect-metrics", handle_collect_metrics
     )

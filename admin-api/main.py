@@ -9,11 +9,12 @@
 """
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 import hashlib
+import logging
 import sys
 import os
 import time
@@ -987,6 +988,7 @@ async def suggest_topics_endpoint(
 async def add_source(
     tenant_id: str,
     req: SourceAddRequest,
+    background: BackgroundTasks,
     principal: Principal = Depends(get_principal),
 ) -> SourceAddResponse:
     """Добавить новый источник (индексирование происходит в фоне).
@@ -1015,12 +1017,15 @@ async def add_source(
     if req.priority and source.id:
         await asyncio.to_thread(set_tenant_source_priority, source.id, req.priority)
 
-    # TODO: Запустить фоновую задачу на индексирование через Celery/APScheduler
+    # Запускаем индексацию в фоне (после ответа): бот скрейпит источник и
+    # апсертит его в RAG, проставляя posts_indexed. Источник уже в БД, так что
+    # даже если бот сейчас недоступен — ночной reindex_references его подхватит.
+    background.add_task(_index_source_bg, tenant_id, req.source_chat_id)
 
     return SourceAddResponse(
         success=True,
         source_id=source.id or 0,
-        posts_indexed=0,  # Будет обновлено после индексирования
+        posts_indexed=0,  # Обновится в фоне; фронт может перезапросить список источников
     )
 
 
@@ -1089,6 +1094,20 @@ async def _proxy_to_bot(method: str, path: str, json_body: Optional[dict] = None
             detail = r.text
         raise HTTPException(status_code=r.status_code, detail=detail)
     return r.json()
+
+
+async def _index_source_bg(tenant_id: str, source: str) -> None:
+    """Фоновая индексация источника: делегируем боту (он владеет Telethon-сессией
+    и RAG-клиентом). Ошибки не пробрасываем — это фон, ночной reindex_references
+    всё равно подхватит источник. Просто логируем."""
+    try:
+        await _proxy_to_bot(
+            "POST",
+            f"/internal/tenants/{tenant_id}/index-source",
+            {"source": source},
+        )
+    except Exception as e:
+        logging.warning("Manba fon indeksatsiyasi xatosi (%s / %s): %s", source, tenant_id, e)
 
 
 @app.post("/api/admin/tenants", tags=["Tenants"])

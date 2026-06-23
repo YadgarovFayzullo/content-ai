@@ -17,7 +17,7 @@ from aiogram import Bot
 
 from bot import rag_client
 from bot.config import SCRAPE_HISTORY_LIMIT
-from bot.scraper import scrape_channel_history
+from bot.scraper import scrape_source
 from database import (
     TenantProfile,
     add_tenant_source,
@@ -123,6 +123,29 @@ async def schedule_tick(bot: Bot) -> None:
         asyncio.create_task(_publish_due(bot, profile, slot))
 
 
+async def index_source(
+    tenant_id: str, src: str, limit: int = SCRAPE_HISTORY_LIMIT
+) -> int:
+    """Скрейпит ОДИН источник (канал или сайт) и индексирует его в RAG.
+
+    Возвращает число проиндексированных чанков (0 — пусто или ошибка). При успехе
+    обновляет `posts_indexed` источника в БД. Id поста = `f"{src}:{post_id}"`, а
+    точка RAG = uuid5(tenant:post_id) → повторная индексация апсертит (без дублей)
+    и добавляет новое. Используется и ночным reindex_references, и фоновой
+    индексацией при добавлении источника через admin-api.
+    """
+    posts = await scrape_source(src, limit=limit)
+    if not posts:
+        logging.warning(f"Skreyp bo'sh ({src} / {tenant_id})")
+        return 0
+    for p in posts:
+        p["id"] = f"{src}:{p['id']}"
+    indexed = await rag_client.index_posts(tenant_id, posts, is_reference=True)
+    if indexed:
+        await asyncio.to_thread(add_tenant_source, tenant_id, src, indexed)
+    return indexed
+
+
 async def reindex_references() -> None:
     """Раз в сутки заново скрейпит все референс-каналы всех арендаторов и
     переиндексирует их в RAG. Точка-id = uuid5(tenant:post_id) — повторная
@@ -135,20 +158,8 @@ async def reindex_references() -> None:
     for profile in tenants:
         sources = await asyncio.to_thread(get_tenant_sources, profile.tenant_id)
         for s in sources:
-            src = s.source_chat_id
-            posts = await scrape_channel_history(src, limit=SCRAPE_HISTORY_LIMIT)
-            if not posts:
-                logging.warning(f"Re-skreyp bo'sh ({src} / {profile.chat_id})")
-                continue
-            for p in posts:
-                p["id"] = f"{src}:{p['id']}"
-            indexed = await rag_client.index_posts(
-                profile.tenant_id, posts, is_reference=True
-            )
+            indexed = await index_source(profile.tenant_id, s.source_chat_id)
             if indexed:
-                await asyncio.to_thread(
-                    add_tenant_source, profile.tenant_id, src, indexed
-                )
                 total_sources += 1
                 total_indexed += indexed
             await asyncio.sleep(2)  # бережём rate-limit Telethon
