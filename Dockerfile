@@ -15,6 +15,10 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Chromium для Playwright (рендер сайтов под JS-challenge Cloudflare).
+# --with-deps доустанавливает системные библиотеки, которых нет в slim-образе.
+RUN playwright install --with-deps chromium
+
 # Копируем код проекта
 COPY . .
 

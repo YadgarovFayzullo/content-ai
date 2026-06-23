@@ -9,6 +9,8 @@ requests
 psycopg2-binary
 telethon
 httpx
+feedparser
+playwright
 tzdata
 fastapi
 uvicorn[standard]

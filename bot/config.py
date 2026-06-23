@@ -24,6 +24,11 @@ SCRAPE_HISTORY_LIMIT = int(os.getenv("SCRAPE_HISTORY_LIMIT", "600"))
 # Каждая статья — отдельный HTTP-запрос, поэтому потолок ниже, чем у каналов.
 WEB_MAX_ARTICLES = int(os.getenv("WEB_MAX_ARTICLES", "40"))
 
+# Рендерить ли страницы headless-браузером (Playwright), когда обычный HTTP-запрос
+# упирается в JS-challenge Cloudflare (403). Требует установленного playwright +
+# chromium (см. Dockerfile). На слабых инстансах можно выключить: WEB_RENDER=0.
+WEB_RENDER = os.getenv("WEB_RENDER", "1").lower() not in ("0", "false", "no")
+
 DEFAULT_FORBIDDEN_TOPICS = (
     "o'lim, terror, din, ekstremizm, siyosat, urush, narkotik, kasallik, jinoyat, "
     "смерть, террор, религия, политика, война, наркотики, болезнь, преступление"
