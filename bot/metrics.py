@@ -16,6 +16,7 @@ from database import (
     get_active_tenants,
     get_posts_for_metrics,
     get_tenant_profile,
+    mark_post_deleted,
     save_channel_stat,
     save_metric,
 )
@@ -90,10 +91,12 @@ async def collect_metrics() -> int:
             entity = await client.get_entity(_peer(profile.chat_id))
             msg = await client.get_messages(entity, ids=post.message_id)
             if not msg:
+                # Сообщения нет в канале → админ удалил его. Помечаем удалённым,
+                # чтобы исключить из аналитики и больше не переснимать метрики.
                 skipped += 1
-                logging.warning(
-                    "Metrika o'tkazib yuborildi (post %s): %s kanalida %s xabar topilmadi "
-                    "(o'chirilgan yoki message_id noto'g'ri).",
+                await asyncio.to_thread(mark_post_deleted, post.id)
+                logging.info(
+                    "Post %s o'chirilgan deb belgilandi: %s kanalida %s xabar yo'q.",
                     post.id, profile.chat_id, post.message_id,
                 )
                 continue

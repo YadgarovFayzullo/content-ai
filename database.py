@@ -138,6 +138,10 @@ class PostHistory(SQLModel, table=True):
     content: str
     image_path: Optional[str] = None
     posted: bool = Field(default=False)
+    # Пост удалён из канала (админом вручную в Telegram). Сборщик метрик ставит
+    # этот флаг, когда get_messages возвращает пусто. Удалённые посты исключаются
+    # из аналитики/ротации/повторного сбора метрик, но строка остаётся (для аудита).
+    deleted: bool = Field(default=False, index=True)
     # message_id в Telegram — нужен для последующего сбора метрик поста.
     message_id: Optional[int] = Field(default=None, index=True)
     # Repost-режим: исходный пост, из которого пересобран этот. Нужны для дедупа —
@@ -329,6 +333,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "message_id": "INTEGER",
         "source_chat_id": "VARCHAR",
         "source_message_id": "INTEGER",
+        "deleted": "BOOLEAN DEFAULT FALSE",
     },
     "tenant_rules": {"is_system": "BOOLEAN DEFAULT FALSE"},
     "tenant_sources": {"priority": "INTEGER DEFAULT 0"},
@@ -720,10 +725,26 @@ def get_recent_posts(tenant_id: str, limit: int = 5) -> List[PostHistory]:
             session.exec(
                 select(PostHistory)
                 .where(PostHistory.tenant_id == tenant_id)
+                .where(PostHistory.deleted == False)  # noqa: E712
                 .order_by(PostHistory.created_at.desc())
                 .limit(limit)
             ).all()
         )
+
+
+def mark_post_deleted(post_id: int) -> bool:
+    """Помечает пост удалённым из канала (его удалил админ в Telegram).
+
+    Вызывается сборщиком метрик, когда сообщение в канале больше не находится.
+    Строку не удаляем (аудит), но исключаем из аналитики/ротации/сбора метрик."""
+    with Session(engine, expire_on_commit=False) as session:
+        post = session.get(PostHistory, post_id)
+        if not post or post.deleted:
+            return False
+        post.deleted = True
+        session.add(post)
+        session.commit()
+        return True
 
 
 # --- Дедуп перед генерацией (что уже опубликовано) ----------------------------
@@ -747,6 +768,7 @@ def get_recent_post_topics(tenant_id: str, limit: int = 20) -> List[str]:
         rows = session.exec(
             select(PostHistory.topic)
             .where(PostHistory.tenant_id == tenant_id)
+            .where(PostHistory.deleted == False)  # noqa: E712
             .order_by(PostHistory.created_at.desc())
             .limit(limit)
         ).all()
@@ -964,6 +986,7 @@ def get_posts_for_metrics(since: datetime) -> List[PostHistory]:
             session.exec(
                 select(PostHistory)
                 .where(PostHistory.posted == True)  # noqa: E712
+                .where(PostHistory.deleted == False)  # noqa: E712
                 .where(PostHistory.message_id.is_not(None))
                 .where(PostHistory.created_at >= since)
                 .where(
@@ -1113,6 +1136,7 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
                 select(PostHistory)
                 .where(PostHistory.tenant_id == tenant_id)
                 .where(PostHistory.posted == True)  # noqa: E712
+                .where(PostHistory.deleted == False)  # noqa: E712
                 .where(PostHistory.created_at >= since)
                 .order_by(PostHistory.created_at.desc())
             ).all()
