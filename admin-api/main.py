@@ -705,11 +705,13 @@ async def get_stats(
 async def get_insights(
     tenant_id: str,
     days: int = Query(30, ge=1, le=365),
+    tz: Optional[str] = Query(None, description="IANA-таймзона пользователя для пика активности"),
     principal: Principal = Depends(get_principal),
 ):
     """Детерминированные AI Insights канала (без LLM): оба прокси «% активных»,
     активные часы, контраст тем, прогноз охвата. На basic-аналитике окно урезано
-    и тематические инсайты не отдаются — как в /stats."""
+    и тематические инсайты не отдаются — как в /stats. tz — для показа пика
+    активности в локальном времени пользователя (иначе UTC)."""
     profile = await _require_tenant(principal, tenant_id)
     from analytics_agent import build_insights
 
@@ -719,7 +721,7 @@ async def get_insights(
     )
     if basic:
         days = min(days, BASIC_ANALYTICS_MAX_DAYS)
-    insights = await asyncio.to_thread(build_insights, tenant_id, days)
+    insights = await asyncio.to_thread(build_insights, tenant_id, days, tz)
     if basic:
         insights["by_topic"] = []
         insights["topic_contrast"] = None
@@ -733,6 +735,9 @@ class AiChatRequest(BaseModel):
     # Прошлые реплики диалога [{role: "user"|"assistant", content}] — для контекста.
     history: Optional[List[dict]] = None
     days: Optional[int] = 30
+    # IANA-таймзона пользователя из браузера (напр. "Asia/Tashkent") — в ней
+    # показываем пик активности вместо UTC. None → UTC.
+    tz: Optional[str] = None
 
 
 @app.post("/api/admin/tenants/{tenant_id}/ai-chat", tags=["Metrics"])
@@ -762,7 +767,7 @@ async def ai_chat_endpoint(
     history = (req.history or [])[-10:]
     try:
         result = await asyncio.to_thread(
-            analytics_chat, tenant_id, message, history, days
+            analytics_chat, tenant_id, message, history, days, req.tz
         )
     except Exception as e:
         logging.error("AI chat error (tenant %s): %s", tenant_id, e)

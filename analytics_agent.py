@@ -24,6 +24,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from database import (
     get_latest_broadcast_stat,
@@ -42,13 +43,20 @@ _MIN_POSTS_FOR_HOURLY = 5
 _FORECAST_LOW = 0.6
 _FORECAST_HIGH = 0.9
 
+# Сколько постов и какой длины подавать LLM «на чтение». Берём самые
+# просматриваемые (на них учиться, что заходит), текст обрезаем — чтобы агент
+# видел заголовок/зачин/структуру/CTA, не раздувая промпт всем каналом.
+_POSTS_SAMPLE_MAX = 12
+_POST_CONTENT_TRUNCATE = 700
+
 
 def _peak_hours(window_posts: List[dict]) -> Optional[dict]:
     """Лучшее непрерывное 3-часовое окно публикации по сумме просмотров.
 
     Это активность по ВРЕМЕНИ ПУБЛИКАЦИИ (когда вышедшие посты набирают охват) —
     честный прокси к активным часам аудитории, а не данные о заходах (их нет).
-    Часы — UTC; перевод в таймзону канала остаётся на отображающий слой."""
+    Считаем в UTC и отдаём сырые часы (start_hour_utc/end_hour_utc); перевод в
+    локальную таймзону пользователя делает _localize_active_hours()."""
     if len(window_posts) < _MIN_POSTS_FOR_HOURLY:
         return None
     by_hour: dict[int, int] = defaultdict(int)
@@ -67,10 +75,45 @@ def _peak_hours(window_posts: List[dict]) -> Optional[dict]:
 
     end = (best_start + 3) % 24
     return {
-        "window": f"{best_start:02d}:00–{end:02d}:00 UTC",
+        "start_hour_utc": best_start,
+        "end_hour_utc": end,
         "share_pct": round(best_views / total * 100, 1),
         "by_hour": {h: by_hour.get(h, 0) for h in range(24)},
     }
+
+
+def _localize_active_hours(active_hours: Optional[dict], tz: Optional[str]) -> Optional[dict]:
+    """Добавляет в active_hours человекочитаемое окно `window` в таймзоне `tz`.
+
+    `tz` — IANA-имя из браузера пользователя (напр. "Asia/Tashkent"). Если не
+    задано или нераспознаваемо — показываем UTC, чтобы не врать о времени.
+    Конвертируем через настоящий datetime (today), поэтому корректны и смещения
+    с минутами (Иран +3:30, Индия +5:30), и DST."""
+    if not active_hours:
+        return active_hours
+
+    zone, label = None, "UTC"
+    if tz:
+        try:
+            zone = ZoneInfo(tz)
+            label = tz
+        except Exception:
+            zone = None  # неизвестная таймзона → честный UTC
+
+    def _fmt(utc_hour: int) -> str:
+        base = datetime.now(timezone.utc).replace(
+            hour=utc_hour, minute=0, second=0, microsecond=0
+        )
+        local = base.astimezone(zone) if zone else base
+        return local.strftime("%H:%M")
+
+    out = dict(active_hours)
+    out["window"] = (
+        f"{_fmt(active_hours['start_hour_utc'])}–"
+        f"{_fmt(active_hours['end_hour_utc'])} {label}"
+    )
+    out["timezone"] = label
+    return out
 
 
 def _topic_contrast(by_topic: List[dict]) -> Optional[dict]:
@@ -117,11 +160,39 @@ def _forecast(total_published: int, days: int, avg_views: int, extra_per_week: i
     }
 
 
-def build_insights(tenant_id: str, days: int = 30) -> dict:
+def _posts_sample(window_posts: List[dict]) -> List[dict]:
+    """Текст постов «на чтение» агенту: самые просматриваемые, текст обрезан.
+
+    Сортируем по просмотрам (агент видит, ЧТО заходит у канала), берём до
+    _POSTS_SAMPLE_MAX, схлопываем пробелы и режем до _POST_CONTENT_TRUNCATE."""
+    posts = [p for p in window_posts if (p.get("content") or "").strip()]
+    if not posts:
+        return []
+    chosen = sorted(posts, key=lambda p: p.get("views", 0), reverse=True)[:_POSTS_SAMPLE_MAX]
+    out: List[dict] = []
+    for p in chosen:
+        text = " ".join((p["content"] or "").split())
+        if len(text) > _POST_CONTENT_TRUNCATE:
+            text = text[:_POST_CONTENT_TRUNCATE].rstrip() + "…"
+        out.append(
+            {
+                "topic": p.get("topic") or "—",
+                "views": p.get("views", 0),
+                "reactions": p.get("reactions", 0),
+                "forwards": p.get("forwards", 0),
+                "text": text,
+            }
+        )
+    return out
+
+
+def build_insights(tenant_id: str, days: int = 30, tz: Optional[str] = None) -> dict:
     """Детерминированные AI Insights канала за `days` дней (без LLM).
 
     Возвращает реальные числа: оба прокси «% активных», активные часы, контраст
-    тем, прогноз охвата + сырой summary/by_topic для графиков и для LLM-слоя."""
+    тем, прогноз охвата + сырой summary/by_topic для графиков и для LLM-слоя.
+    `tz` — IANA-таймзона пользователя (из браузера): в ней показываем пик
+    активности; None → UTC. posts_sample — тексты постов для чтения LLM-слоем."""
     stats = get_tenant_stats(tenant_id, days=days, limit=100)
     summary = stats.get("summary", {})
     by_topic = stats.get("by_topic", [])
@@ -156,13 +227,14 @@ def build_insights(tenant_id: str, days: int = 30) -> dict:
                 "а не точная доля активных."
             ),
         },
-        "active_hours": _peak_hours(window_posts),
+        "active_hours": _localize_active_hours(_peak_hours(window_posts), tz),
         "topic_contrast": _topic_contrast(by_topic),
         "forecast": _forecast(
             summary.get("total_published", 0), days, avg_views
         ),
         "summary": summary,
         "by_topic": by_topic,
+        "posts_sample": _posts_sample(window_posts),
     }
 
 
@@ -225,6 +297,18 @@ def _insights_to_prompt(insights: dict) -> str:
             f"Прогноз (оценка): сейчас ~{f['current_posts_per_week']} постов/нед; "
             f"+{f['extra_posts_per_week']} поста/нед → прирост охвата ≈ {lo}–{hi}%."
         )
+
+    sample = insights.get("posts_sample") or []
+    if sample:
+        lines.append(
+            f"\n=== ТЕКСТЫ ПОСТОВ (выборка {len(sample)} самых просматриваемых, "
+            "текст обрезан) — ЧИТАЙ их, оценивай заголовки, структуру, подачу, CTA ==="
+        )
+        for i, p in enumerate(sample, 1):
+            lines.append(
+                f"[{i}] тема «{p['topic']}» · {p['views']} просм. / "
+                f"{p['reactions']} реакц. / {p['forwards']} пересыл.\n{p['text']}"
+            )
     return "\n".join(lines)
 
 
@@ -242,6 +326,14 @@ _SYSTEM_PROMPT = (
     "используй ТОЛЬКО когда владелец просит общий разбор/аналитику канала «в целом» "
     "(«проанализируй канал», «что по статистике», «как дела у канала»). Для всех "
     "остальных вопросов — обычный связный ответ по сути, без этих заголовков.\n\n"
+    "ЧТЕНИЕ ПОСТОВ: в блоке данных есть раздел «ТЕКСТЫ ПОСТОВ» — это реальный текст "
+    "постов канала. Когда владелец просит «прочитай посты», «как улучшить контент/"
+    "канал», «что не так с постами» — РЕАЛЬНО разбирай эти тексты: заголовки и первую "
+    "строку (хук), структуру, длину, читаемость, наличие и силу призыва к действию "
+    "(CTA), и связывай это с просмотрами/реакциями каждого поста. Давай конкретные "
+    "правки по конкретным постам, а НЕ отписку «проанализируйте содержание сами». "
+    "Если раздела с текстами нет (постов в окне нет) — честно скажи, что читать пока "
+    "нечего.\n\n"
     "Про «% активных»: Telegram не сообщает, кто открывал канал. Не называй прокси "
     "(reach rate / уведомления) точным числом активных — поясняй, что это оценка. "
     "Отвечай кратко, по делу, на языке канала."
@@ -253,15 +345,17 @@ def chat(
     message: str,
     history: Optional[List[dict]] = None,
     days: int = 30,
+    tz: Optional[str] = None,
 ) -> dict:
     """ИИ-менеджер отвечает на вопрос о канале поверх реальных метрик.
 
     Возвращает {"reply": str, "insights": dict}: текст для чата + сами числа
     (фронт может показать карточки/графики рядом с ответом). history — прошлые
-    реплики чата [{role, content}] для контекста диалога."""
+    реплики чата [{role, content}] для контекста диалога. tz — IANA-таймзона
+    пользователя (из браузера), в ней показывается пик активности."""
     from generator import groq_chat
 
-    insights = build_insights(tenant_id, days)
+    insights = build_insights(tenant_id, days, tz)
     profile = get_tenant_profile(tenant_id)
     channel_name = getattr(profile, "channel_name", "") or tenant_id
     language = getattr(profile, "language", "") or "ru"

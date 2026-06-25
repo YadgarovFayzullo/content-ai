@@ -1385,9 +1385,11 @@ def get_window_post_metrics(tenant_id: str, days: int = 30) -> List[dict]:
     полный набор постов окна (в отличие от get_tenant_stats, где recent_posts
     урезается под limit).
 
-    Возвращает [{"posted_at": datetime, "topic", "views", "forwards",
+    Возвращает [{"posted_at": datetime, "topic", "content", "views", "forwards",
     "reactions"}], отсортировано новые→старые. posted_at — aware datetime (UTC),
-    None отбрасываем (без времени публикации пост в часовую аналитику не идёт)."""
+    None отбрасываем (без времени публикации пост в часовую аналитику не идёт).
+    content — полный текст поста: нужен ИИ-агенту, чтобы реально ЧИТАТЬ посты
+    (оценивать заголовки/структуру/CTA), а не только их числовые метрики."""
     since = _utcnow() - timedelta(days=days)
     with Session(engine, expire_on_commit=False) as session:
         posts = list(
@@ -1424,6 +1426,7 @@ def get_window_post_metrics(tenant_id: str, days: int = 30) -> List[dict]:
                 {
                     "posted_at": p.created_at,
                     "topic": p.topic or "—",
+                    "content": p.content or "",
                     "views": m.views if m else 0,
                     "forwards": m.forwards if m else 0,
                     "reactions": m.reactions if m else 0,
