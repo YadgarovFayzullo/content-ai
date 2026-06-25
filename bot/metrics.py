@@ -17,10 +17,17 @@ from database import (
     get_posts_for_metrics,
     get_tenant_profile,
     mark_post_deleted,
+    save_broadcast_stat,
     save_channel_stat,
     save_metric,
 )
-from bot.scraper import _creds_ready, _get_client, _peer, get_subscriber_count
+from bot.scraper import (
+    _creds_ready,
+    _get_client,
+    _peer,
+    get_broadcast_stats,
+    get_subscriber_count,
+)
 
 # Окно сбора: посты старше уже стабилизировались, их не переснимаем.
 METRICS_WINDOW_DAYS = 7
@@ -54,6 +61,36 @@ async def collect_subscriber_counts() -> int:
     return saved
 
 
+async def collect_broadcast_stats() -> int:
+    """Снимок Telegram Broadcast Stats по всем активным каналам. Возвращает число
+    сохранённых замеров. Канал-уровневая метрика (как и подписчики) — отдельный
+    проход по арендаторам. Маленькие/недоступные каналы Telegram не отдаёт —
+    такие просто пропускаем (статистика остаётся пустой, аналитика откатится на
+    наши post_metrics)."""
+    if not _creds_ready():
+        return 0
+    tenants = await asyncio.to_thread(get_active_tenants)
+    saved = 0
+    for profile in tenants:
+        try:
+            stats = await get_broadcast_stats(profile.chat_id)
+            if not stats:
+                continue
+            await asyncio.to_thread(
+                save_broadcast_stat,
+                profile.tenant_id,
+                enabled_notifications_pct=stats.get("enabled_notifications_pct"),
+                views_per_post=stats.get("views_per_post"),
+                shares_per_post=stats.get("shares_per_post"),
+                reactions_per_post=stats.get("reactions_per_post"),
+            )
+            saved += 1
+        except Exception as e:
+            logging.error("Broadcast stats xatosi (%s): %s", profile.chat_id, e)
+    logging.info("Broadcast stats yig'ildi: %d ta kanal.", saved)
+    return saved
+
+
 async def collect_metrics() -> int:
     """Снимает метрики свежих постов всех арендаторов. Возвращает число замеров.
 
@@ -63,8 +100,10 @@ async def collect_metrics() -> int:
         logging.warning("Telethon sozlanmagan — metrikalar yig'ilmadi.")
         return 0
 
-    # Подписчиков снимаем всегда (даже если свежих постов нет).
+    # Подписчиков и Broadcast Stats снимаем всегда (даже если свежих постов нет) —
+    # это канал-уровневые метрики, не привязанные к постам.
     await collect_subscriber_counts()
+    await collect_broadcast_stats()
 
     since = datetime.now(timezone.utc) - timedelta(days=METRICS_WINDOW_DAYS)
     posts = await asyncio.to_thread(get_posts_for_metrics, since)

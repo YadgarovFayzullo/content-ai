@@ -202,6 +202,31 @@ class ChannelStat(SQLModel, table=True):
     captured_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+class ChannelBroadcastStat(SQLModel, table=True):
+    """Снимок Telegram Broadcast Stats канала (stats.getBroadcastStats).
+
+    Канал-уровневая метрика, недоступная через Bot API и обычный MTProto —
+    только официальная статистика канала (от ~50+ подписчиков, у user-сессии-
+    админа). Здесь то, что Telegram отдаёт честно и стабильно:
+      - enabled_notifications_pct — % подписчиков с включёнными уведомлениями.
+        Самый близкий ОФИЦИАЛЬНЫЙ прокси к «активной аудитории»: Telegram НЕ
+        отдаёт, кто и когда открывал канал, поэтому «% активных» строим из этого
+        (а не из мифических данных о просмотрах по пользователям).
+      - views/shares/reactions_per_post — средние за период из самой статистики.
+    Несколько строк на канал = история; берём последний снимок. None-поля —
+    канал слишком мал для статистики (или поле отсутствует в ответе)."""
+
+    __tablename__ = "channel_broadcast_stats"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(index=True)
+    enabled_notifications_pct: Optional[float] = None
+    views_per_post: Optional[float] = None
+    shares_per_post: Optional[float] = None
+    reactions_per_post: Optional[float] = None
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
 class RepostStory(SQLModel, table=True):
     """Опубликованная «история» repost-режима (V2): кластер постов-источников об
     одном событии, сведённый в один канонический пост.
@@ -1308,3 +1333,100 @@ def get_channel_subscriber_series(tenant_id: str, limit: int = 30) -> List[int]:
             .limit(limit)
         ).all()
         return [r.subscribers for r in reversed(rows)]
+
+
+def save_broadcast_stat(
+    tenant_id: str,
+    *,
+    enabled_notifications_pct: Optional[float] = None,
+    views_per_post: Optional[float] = None,
+    shares_per_post: Optional[float] = None,
+    reactions_per_post: Optional[float] = None,
+) -> ChannelBroadcastStat:
+    """Сохраняет снимок Telegram Broadcast Stats канала."""
+    with Session(engine, expire_on_commit=False) as session:
+        stat = ChannelBroadcastStat(
+            tenant_id=tenant_id,
+            enabled_notifications_pct=enabled_notifications_pct,
+            views_per_post=views_per_post,
+            shares_per_post=shares_per_post,
+            reactions_per_post=reactions_per_post,
+        )
+        session.add(stat)
+        session.commit()
+        session.refresh(stat)
+        return stat
+
+
+def get_latest_broadcast_stat(tenant_id: str) -> Optional[dict]:
+    """Последний снимок Broadcast Stats канала. None, если статистики ещё нет
+    (канал слишком мал / Telethon не настроен / ни одного успешного сбора)."""
+    with Session(engine, expire_on_commit=False) as session:
+        row = session.exec(
+            select(ChannelBroadcastStat)
+            .where(ChannelBroadcastStat.tenant_id == tenant_id)
+            .order_by(ChannelBroadcastStat.captured_at.desc())
+            .limit(1)
+        ).first()
+        if not row:
+            return None
+        return {
+            "enabled_notifications_pct": row.enabled_notifications_pct,
+            "views_per_post": row.views_per_post,
+            "shares_per_post": row.shares_per_post,
+            "reactions_per_post": row.reactions_per_post,
+            "captured_at": row.captured_at.isoformat() if row.captured_at else None,
+        }
+
+
+def get_window_post_metrics(tenant_id: str, days: int = 30) -> List[dict]:
+    """Все опубликованные (не удалённые) посты за `days` дней с ПОСЛЕДНИМ замером
+    метрик по каждому. Для аналитики активных часов и прогноза охвата — нужен
+    полный набор постов окна (в отличие от get_tenant_stats, где recent_posts
+    урезается под limit).
+
+    Возвращает [{"posted_at": datetime, "topic", "views", "forwards",
+    "reactions"}], отсортировано новые→старые. posted_at — aware datetime (UTC),
+    None отбрасываем (без времени публикации пост в часовую аналитику не идёт)."""
+    since = _utcnow() - timedelta(days=days)
+    with Session(engine, expire_on_commit=False) as session:
+        posts = list(
+            session.exec(
+                select(PostHistory)
+                .where(PostHistory.tenant_id == tenant_id)
+                .where(PostHistory.posted == True)  # noqa: E712
+                .where(PostHistory.deleted == False)  # noqa: E712
+                .where(PostHistory.created_at >= since)
+                .order_by(PostHistory.created_at.desc())
+            ).all()
+        )
+        if not posts:
+            return []
+
+        post_ids = [p.id for p in posts]
+        metrics = session.exec(
+            select(PostMetric)
+            .where(PostMetric.tenant_id == tenant_id)
+            .where(PostMetric.post_id.in_(post_ids))
+        ).all()
+        latest: dict[int, PostMetric] = {}
+        for m in metrics:
+            cur = latest.get(m.post_id)
+            if cur is None or m.captured_at > cur.captured_at:
+                latest[m.post_id] = m
+
+        out: List[dict] = []
+        for p in posts:
+            if not p.created_at:
+                continue
+            m = latest.get(p.id)
+            out.append(
+                {
+                    "posted_at": p.created_at,
+                    "topic": p.topic or "—",
+                    "views": m.views if m else 0,
+                    "forwards": m.forwards if m else 0,
+                    "reactions": m.reactions if m else 0,
+                }
+            )
+        return out

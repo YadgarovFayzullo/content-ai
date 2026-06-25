@@ -701,6 +701,75 @@ async def get_stats(
     return stats
 
 
+@app.get("/api/admin/tenants/{tenant_id}/insights", tags=["Metrics"])
+async def get_insights(
+    tenant_id: str,
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(get_principal),
+):
+    """Детерминированные AI Insights канала (без LLM): оба прокси «% активных»,
+    активные часы, контраст тем, прогноз охвата. На basic-аналитике окно урезано
+    и тематические инсайты не отдаются — как в /stats."""
+    profile = await _require_tenant(principal, tenant_id)
+    from analytics_agent import build_insights
+
+    basic = (
+        not principal.is_super
+        and limits_for(profile.subscription_tier)["analytics"] == "basic"
+    )
+    if basic:
+        days = min(days, BASIC_ANALYTICS_MAX_DAYS)
+    insights = await asyncio.to_thread(build_insights, tenant_id, days)
+    if basic:
+        insights["by_topic"] = []
+        insights["topic_contrast"] = None
+        insights["forecast"] = None
+        insights["analytics_tier"] = "basic"
+    return insights
+
+
+class AiChatRequest(BaseModel):
+    message: str
+    # Прошлые реплики диалога [{role: "user"|"assistant", content}] — для контекста.
+    history: Optional[List[dict]] = None
+    days: Optional[int] = 30
+
+
+@app.post("/api/admin/tenants/{tenant_id}/ai-chat", tags=["Metrics"])
+async def ai_chat_endpoint(
+    tenant_id: str,
+    req: AiChatRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """ИИ-агент-менеджер: отвечает на вопрос о канале поверх реальных метрик
+    (build_insights → Groq). Числа считаются детерминированно, LLM только
+    формулирует «что/почему/что делать». Окно урезается на basic-тарифе."""
+    profile = await _require_tenant(principal, tenant_id)
+    from analytics_agent import chat as analytics_chat
+
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+
+    days = req.days or 30
+    if (
+        not principal.is_super
+        and limits_for(profile.subscription_tier)["analytics"] == "basic"
+    ):
+        days = min(days, BASIC_ANALYTICS_MAX_DAYS)
+
+    # history передаём как есть, но ограничиваем длину — защита от раздувания промпта.
+    history = (req.history or [])[-10:]
+    try:
+        result = await asyncio.to_thread(
+            analytics_chat, tenant_id, message, history, days
+        )
+    except Exception as e:
+        logging.error("AI chat error (tenant %s): %s", tenant_id, e)
+        raise HTTPException(status_code=502, detail=f"AI agent error: {e}")
+    return result
+
+
 @app.get("/api/admin/tenants/{tenant_id}/posts", response_model=PostsListResponse, tags=["Posts"])
 async def get_posts(
     tenant_id: str,

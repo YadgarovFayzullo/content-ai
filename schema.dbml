@@ -71,8 +71,24 @@ Table post_metrics {
   }
 }
 
+Table channel_broadcast_stats {
+  id                        int       [pk, increment]
+  tenant_id                varchar   [not null]
+  enabled_notifications_pct float     [null, note: '% подписчиков с включёнными уведомлениями (Telegram Broadcast Stats)']
+  views_per_post            float     [null]
+  shares_per_post           float     [null]
+  reactions_per_post        float     [null]
+  captured_at               timestamp [note: 'Снимок официальной статистики канала; есть не у всех каналов']
+
+  indexes {
+    tenant_id
+    captured_at
+  }
+}
+
 // --- Логические связи (FK на уровне приложения, по tenant_id/post_id) ---
 Ref: tenant_rules.tenant_id   > tenant_profiles.tenant_id
 Ref: posts_history.tenant_id  > tenant_profiles.tenant_id
 Ref: post_metrics.tenant_id   > tenant_profiles.tenant_id
 Ref: post_metrics.post_id     > posts_history.id
+Ref: channel_broadcast_stats.tenant_id > tenant_profiles.tenant_id

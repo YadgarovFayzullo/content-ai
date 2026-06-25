@@ -27,6 +27,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaPhoto
 from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.stats import GetBroadcastStatsRequest
 
 from bot.config import (
     TELEGRAM_API_ID,
@@ -88,6 +89,54 @@ async def get_subscriber_count(chat_id: Any) -> Optional[int]:
         return int(getattr(full.full_chat, "participants_count", 0) or 0)
     except Exception as e:
         logging.warning("Obunachilar sonini olishda xato (%s): %s", chat_id, e)
+        return None
+
+
+def _abs_current(value: Any) -> Optional[float]:
+    """Текущее значение из StatsAbsValueAndPrev (.current). None при отсутствии."""
+    cur = getattr(value, "current", None)
+    return float(cur) if cur is not None else None
+
+
+def _percent(value: Any) -> Optional[float]:
+    """% из StatsPercentValue (part/total*100). None, если total == 0/нет."""
+    part = getattr(value, "part", None)
+    total = getattr(value, "total", None)
+    if not total:
+        return None
+    return round(float(part) / float(total) * 100, 1)
+
+
+async def get_broadcast_stats(chat_id: Any) -> Optional[dict]:
+    """Официальная статистика канала (stats.getBroadcastStats) через MTProto.
+
+    Доступна только админу канала и только для каналов от ~50 подписчиков —
+    для маленьких/недоступных каналов Telegram бросает ошибку, тогда возвращаем
+    None (аналитика откатывается на наши собственные post_metrics).
+
+    Берём ТОЛЬКО стабильные скалярные поля: % включённых уведомлений и средние
+    views/shares/reactions на пост. Графики (top_hours и пр.) приходят как
+    async-токены, требуют второго запроса и хрупкого парсинга — активные часы
+    мы и так выводим из наших post_metrics, поэтому их здесь не трогаем."""
+    if not _creds_ready():
+        return None
+    try:
+        client = await _get_client()
+        entity = await client.get_entity(_peer(chat_id))
+        res = await client(GetBroadcastStatsRequest(channel=entity))
+        return {
+            "enabled_notifications_pct": _percent(
+                getattr(res, "enabled_notifications", None)
+            ),
+            "views_per_post": _abs_current(getattr(res, "views_per_post", None)),
+            "shares_per_post": _abs_current(getattr(res, "shares_per_post", None)),
+            "reactions_per_post": _abs_current(
+                getattr(res, "reactions_per_post", None)
+            ),
+        }
+    except Exception as e:
+        # Маленький канал / не админ / STATS_MIGRATE и пр. — статистики просто нет.
+        logging.info("Broadcast stats mavjud emas (%s): %s", chat_id, e)
         return None
 
 
