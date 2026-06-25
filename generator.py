@@ -329,6 +329,13 @@ LIST / BULLET VARIETY (critical)
 - Vary the opening of each item: start one with a vivid fact or number, one with a
   verb, one with a concrete noun, one with an adjective. Across the whole post the
   item openings must be visibly different from one another.
+- BANNED superlative cliché: do NOT describe items with the empty formula "<X> —
+  один из самых известных/крупнейших/старейших…", "one of the most famous/largest/
+  oldest…", "...laridan biri". It is vague filler that repeats across items. Lead
+  with a CONCRETE specific instead — a number, a date, a height/size, the name of a
+  detail, or a vivid fact (e.g. not "Эйфелева башня — одна из самых известных
+  достопримечательностей", but "Эйфелева башня: 324 метра стали, построена за 2 года
+  к выставке 1889-го").
 
 CHANNEL NAME / GREETINGS (critical)
 - `channel_name` is INTERNAL metadata. NEVER write it into the post and NEVER
@@ -514,13 +521,36 @@ def _item_openings(item: str) -> tuple[str, str]:
     return one, two
 
 
+# Превосходное клише «X — один из самых известных/крупнейших/старейших…»,
+# «one of the most …», узб. «…laridan biri». Слабая модель ставит эту пустую
+# конструкцию в каждый пункт, причём ПЕРВЫЕ слова разные, поэтому _item_openings
+# её не ловит — детектим по самой фразе отдельно.
+_CLICHE_RE = re.compile(
+    r"\b(?:один|одна|одно)\s+из\b"   # ru: «один из самых/крупнейших/лучших…»
+    r"|\bone\s+of\s+the\b"           # en: «one of the most/largest/oldest…»
+    r"|lar(?:i)?dan\s+biri\b",       # uz: «…laridan biri»
+    re.IGNORECASE,
+)
+
+
+def _cliche_count(items: List[str]) -> int:
+    """Сколько пунктов используют превосходное клише «один из самых…» / «one of the…».
+    ≥2 — болезнь шаблонного списка, которую не видят зачины пунктов."""
+    n = 0
+    for it in items:
+        if _CLICHE_RE.search(re.sub(r"<[^>]+>", "", it)):
+            n += 1
+    return n
+
+
 def _repetition_score(text: str) -> int:
-    """Насколько одинаково начинаются пункты: максимум среди «сколько пунктов делят
-    одно первое слово» и «…одни первые два слова». ≥2 = есть повтор. 0, если пунктов
-    мало (<3) — не дёргаем ретрай зря."""
+    """Насколько шаблонны пункты: максимум среди «сколько пунктов делят одно первое
+    слово / одни первые два слова» и «сколько пунктов используют клише „один из…“».
+    ≥2 = есть повтор. 0, если пунктов мало (<3) — не дёргаем ретрай зря."""
     items = _LIST_ITEM_RE.findall(text)
     if len(items) < 3:
         return 0
+    cliche = _cliche_count(items)
     ones, twos = [], []
     for it in items:
         o, t = _item_openings(it)
@@ -529,11 +559,11 @@ def _repetition_score(text: str) -> int:
         if t:
             twos.append(t)
     if len(ones) < 3:
-        return 0
+        return cliche
     best = Counter(ones).most_common(1)[0][1]
     if twos:
         best = max(best, Counter(twos).most_common(1)[0][1])
-    return best
+    return max(best, cliche)
 
 
 def _has_repetitive_openings(text: str) -> bool:
@@ -663,7 +693,11 @@ def generate_post(ctx: GenerationContext) -> str:
                 "structure: make one open with a number/fact, one with a verb, one with "
                 "a concrete noun, one with an adjective. NEVER restate the subject's "
                 "name at the start of an item, and NEVER echo the label before the "
-                "colon right after it.\n\n"
+                "colon right after it.\n"
+                "ALSO BANNED: the superlative cliché in items — 'X — один из самых "
+                "известных/крупнейших/старейших…', 'one of the most famous/largest/"
+                "oldest…'. It is empty filler. Lead each item with a CONCRETE specific: "
+                "a number, a date, a height/size, a name of a detail, or a vivid fact.\n\n"
             )
             best_post, best_score = post, _repetition_score(post)
             for attempt in range(3):
