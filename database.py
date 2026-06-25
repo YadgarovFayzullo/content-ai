@@ -260,6 +260,27 @@ class ScheduleSlot(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class TopicAlias(SQLModel, table=True):
+    """Канонический ключ темы для кросс-языкового дедупа ротации.
+
+    `raw` — нормализованная (нижний регистр, схлопнутые пробелы) тема как она
+    встречается в конфиге канала или в истории постов. `topic_key` — её
+    язык-независимый канонический идентификатор (lowercase ASCII), общий для всех
+    вариантов одного и того же сюжета: «дубай», «dubai», «discover дубай» → "dubai".
+    Так ротация тем (pick_topic) видит, что «Сингапур» и «Singapore» — одно и то же,
+    и не публикует один и тот же город дважды на разных языках.
+
+    Кэш: ключ считается ИИ один раз на новую тему и сохраняется здесь (переживает
+    рестарт, не тратим вызов модели на каждый выбор темы).
+    """
+
+    __tablename__ = "topic_aliases"
+
+    raw: str = Field(primary_key=True)
+    topic_key: str
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 # ---------------------------------------------------------------------------
 # ДВИЖОК БД
 # ---------------------------------------------------------------------------
@@ -730,6 +751,36 @@ def get_recent_post_topics(tenant_id: str, limit: int = 20) -> List[str]:
             .limit(limit)
         ).all()
     return [_norm_topic(t) for t in rows if t]
+
+
+def get_topic_keys(raws: List[str]) -> dict:
+    """Канонические ключи для набора нормализованных тем (из кэша topic_aliases).
+
+    Возвращает {raw: topic_key} только для известных тем; неизвестные опускаются —
+    их посчитает и сохранит вызывающий (orchestrator)."""
+    raws = [r for r in {r for r in raws} if r]
+    if not raws:
+        return {}
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(TopicAlias).where(TopicAlias.raw.in_(raws))
+        ).all()
+    return {r.raw: r.topic_key for r in rows}
+
+
+def save_topic_keys(mapping: dict) -> None:
+    """Сохранить/обновить канонические ключи тем (апсерт по raw)."""
+    mapping = {r: k for r, k in (mapping or {}).items() if r and k}
+    if not mapping:
+        return
+    with Session(engine, expire_on_commit=False) as session:
+        for raw, key in mapping.items():
+            existing = session.get(TopicAlias, raw)
+            if existing:
+                existing.topic_key = key
+            else:
+                session.add(TopicAlias(raw=raw, topic_key=key))
+        session.commit()
 
 
 def find_similar_posts(

@@ -18,10 +18,17 @@ from database import (
     PostHistory,
     get_tenant_profile,
     get_recent_post_topics,
+    get_topic_keys,
+    save_topic_keys,
     find_similar_posts,
 )
 from context_builder import build_generation_context
-from generator import generate_post, generate_illustration, image_subject_for_topic
+from generator import (
+    generate_post,
+    generate_illustration,
+    image_subject_for_topic,
+    canonical_topics,
+)
 from image_search import fetch_stock_photo_sync
 
 DEFAULT_TOPIC = "psixologiya, fan yoki texnologiya haqida qiziqarli mini-fakt"
@@ -57,6 +64,29 @@ def _norm(t: str) -> str:
     return " ".join((t or "").split()).lower()
 
 
+def _canonical_keys(strings: list[str]) -> dict[str, str]:
+    """Канонический (язык-независимый) ключ для каждой строки темы.
+
+    Дедуп ротации должен видеть «Сингапур» и «Singapore» как одно и то же, иначе
+    один и тот же город выходит дважды на разных языках. Ключи считаем ИИ один раз
+    на новую тему и кэшируем в БД (topic_aliases); при недоступности модели
+    откатываемся на нормализованную строку — тогда дедуп деградирует до прежнего
+    поведения (в пределах одного языка), но ничего не ломает."""
+    norm_of = {s: _norm(s) for s in strings if s and s.strip()}
+    uniq = sorted({n for n in norm_of.values() if n})
+    if not uniq:
+        return {}
+
+    cache = get_topic_keys(uniq)  # {norm: key} из кэша
+    missing = [n for n in uniq if n not in cache]
+    if missing:
+        learned = canonical_topics(missing)  # {norm: key}, best-effort
+        resolved = {n: (learned.get(n) or n) for n in missing}
+        save_topic_keys(resolved)
+        cache.update(resolved)
+    return {s: cache.get(norm_of[s], norm_of[s]) for s in norm_of}
+
+
 def pick_topic(profile: TenantProfile) -> tuple[str, bool]:
     """Выбирает тему с дедупом по БД. Возвращает (topic, forced_repeat).
 
@@ -66,7 +96,9 @@ def pick_topic(profile: TenantProfile) -> tuple[str, bool]:
     опубликовано», чтобы движок дал другой угол).
 
     Дедуп опирается на историю в БД (переживает рестарт и общий для бота/админки),
-    а in-process `_RECENT_TOPICS` лишь сглаживает выбор внутри одной сессии."""
+    а in-process `_RECENT_TOPICS` лишь сглаживает выбор внутри одной сессии.
+    Сравнение идёт по КАНОНИЧЕСКОМУ ключу темы (см. _canonical_keys), поэтому
+    «Дубай» и «Dubai» считаются одной темой и не повторяются на разных языках."""
     topics = [t.strip() for t in (profile.topics or "").split(",") if t.strip()]
     if not topics:
         return DEFAULT_TOPIC, False
@@ -77,18 +109,28 @@ def pick_topic(profile: TenantProfile) -> tuple[str, bool]:
     # Темы последних постов из БД (новые→старые). Покрытыми считаем те, что попали
     # в окно последнего «круга» (≈ числа тем) — за круг каждая тема должна выйти раз.
     recent_db = get_recent_post_topics(profile.tenant_id, limit=max(len(topics), 10))
-    recent_mem = [_norm(t) for t in _RECENT_TOPICS.get(profile.tenant_id, [])]
-    covered = set(recent_db[: max(1, len(topics) - 1)]) | set(recent_mem)
+    recent_mem = _RECENT_TOPICS.get(profile.tenant_id, [])
 
-    fresh = [t for t in topics if _norm(t) not in covered]
+    # Канонические ключи для всех участников сравнения (конфиг + история + сессия).
+    keys = _canonical_keys(topics + recent_db + recent_mem)
+
+    def _key(t: str) -> str:
+        return keys.get(t, _norm(t))
+
+    recent_db_keys = [_key(t) for t in recent_db]
+    covered = set(recent_db_keys[: max(1, len(topics) - 1)]) | {
+        _key(t) for t in recent_mem
+    }
+
+    fresh = [t for t in topics if _key(t) not in covered]
     if fresh:
         choice, forced = random.choice(fresh), False
     else:
-        # Все темы освещены → наименее недавно использованная (макс. индекс в recent_db;
-        # отсутствующая в окне считается самой старой).
+        # Все темы освещены → наименее недавно использованная (макс. индекс ключа в
+        # recent_db; отсутствующий в окне считается самым старым).
         def _age(t: str) -> int:
-            n = _norm(t)
-            return recent_db.index(n) if n in recent_db else len(recent_db)
+            k = _key(t)
+            return recent_db_keys.index(k) if k in recent_db_keys else len(recent_db_keys)
 
         choice, forced = max(topics, key=_age), True
 

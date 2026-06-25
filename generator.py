@@ -142,6 +142,50 @@ def suggest_topics(
     return out[:count]
 
 
+def canonical_topics(topics: List[str]) -> dict:
+    """Сводит темы к язык-независимому каноническому ключу для дедупа ротации.
+
+    Для каждого входа возвращает короткий lowercase-ASCII идентификатор основного
+    сюжета: разные язык/написание/обёртки одного и того же сводятся к одному ключу
+    («дубай», «Dubai», «discover дубай» → "dubai"; «испания», «Spain» → "spain").
+
+    Best-effort: при отсутствии ключа Groq или ошибке возвращает {} — вызывающий
+    откатывается на строковую нормализацию (тогда дедуп работает как раньше, в
+    пределах одного языка). Один батч-вызов на все темы (не по одной)."""
+    items = [t for t in (topics or []) if t and t.strip()]
+    if not items or not GROQ_API_KEY:
+        return {}
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+    system = (
+        "You map content topics to a language-agnostic canonical key for "
+        "deduplication. For each numbered topic output a short lowercase ASCII "
+        "key identifying its core subject: translate non-English to English, "
+        "transliterate proper nouns to their common English spelling, drop filler "
+        "words (discover, explore, visit, top-5, guide to). Same real-world subject "
+        "in any language/spelling MUST get the identical key (e.g. 'Дубай' and "
+        "'Dubai' -> dubai; 'Испания' and 'Spain' -> spain). Return ONLY a JSON "
+        "object mapping the input number (as string) to its key. No commentary."
+    )
+    user = f"TOPICS:\n{numbered}\n\nReturn a JSON object like {{\"1\": \"dubai\"}}."
+    try:
+        raw = groq_chat(system, user, temperature=0.0)
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start != -1 and end != -1 else {}
+    except Exception as e:
+        logging.warning("canonical_topics xatosi: %s", e)
+        return {}
+
+    out: dict = {}
+    for i, topic in enumerate(items):
+        key = data.get(str(i + 1))
+        if isinstance(key, str) and key.strip():
+            out[topic] = re.sub(r"\s+", " ", key.strip().lower())
+    return out
+
+
 DEFAULT_IMAGE_STYLE = (
     "Editorial gouache illustration of silhouettes interacting with floating books and symbols "
     "of knowledge in a surreal abstract educational space. Rough brush strokes, thick paint texture, "
