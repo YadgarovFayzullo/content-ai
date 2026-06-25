@@ -27,6 +27,10 @@ COPY orchestrator.py .
 # be present even for the text-only preview path (deps: httpx + PEXELS_API_KEY).
 COPY image_search.py .
 
+# AI manager agent: deterministic insights + Groq narration for /insights and
+# /ai-chat. Imports database + generator (both copied above).
+COPY analytics_agent.py .
+
 # Expose port
 EXPOSE 8001
 
