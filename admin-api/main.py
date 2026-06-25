@@ -54,6 +54,7 @@ from database import (
     remove_tenant_rule,
     get_tenant_sources,
     get_recent_posts,
+    get_last_post_times,
     get_tenant_stats,
     get_tenants_for_owner,
     count_tenants_for_owner,
@@ -290,6 +291,10 @@ class TenantProfileSchema(BaseModel):
     image_mode: str = "ai"
     active: bool
     created_at: str
+    # Время последнего опубликованного (неудалённого) поста — для колонки
+    # «Последний пост». None, если канал ещё ничего не публиковал. Не путать с
+    # created_at (дата подключения канала).
+    last_post_at: Optional[str] = None
     # Владелец (Telegram user_id) и тариф — для restrict mode. capabilities —
     # развёрнутые лимиты тарифа (tiers.py), чтобы фронт сразу знал, что показывать.
     owner_id: Optional[str] = None
@@ -301,8 +306,13 @@ class TenantProfileSchema(BaseModel):
     capabilities: dict = {}
 
 
-def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
-    """Собирает TenantProfileSchema из ORM-профиля (одно место — не дублировать)."""
+def _tenant_schema(
+    profile: TenantProfile, last_post_at: Optional[datetime] = None
+) -> TenantProfileSchema:
+    """Собирает TenantProfileSchema из ORM-профиля (одно место — не дублировать).
+
+    last_post_at — время последнего поста (вычисляется вызывающим батчем для
+    списка, чтобы не делать N+1); None → канал ещё не публиковал."""
     tier = normalize_tier(getattr(profile, "subscription_tier", None))
     return TenantProfileSchema(
         tenant_id=profile.tenant_id,
@@ -326,6 +336,7 @@ def _tenant_schema(profile: TenantProfile) -> TenantProfileSchema:
         image_mode=getattr(profile, "image_mode", None) or "ai",
         active=profile.active,
         created_at=profile.created_at.isoformat() if profile.created_at else None,
+        last_post_at=last_post_at.isoformat() if last_post_at else None,
         owner_id=profile.owner_id,
         subscription_tier=tier,
         schedule_mode=getattr(profile, "schedule_mode", None) or "off",
@@ -596,7 +607,13 @@ async def list_tenants(
         tenants = await asyncio.to_thread(get_all_tenants)
     else:
         tenants = await asyncio.to_thread(get_tenants_for_owner, principal.owner_id)
-    return TenantListResponse(tenants=[_tenant_schema(t) for t in tenants])
+    # Время последнего поста — одним батч-запросом на все каналы (без N+1).
+    last_posts = await asyncio.to_thread(
+        get_last_post_times, [t.tenant_id for t in tenants]
+    )
+    return TenantListResponse(
+        tenants=[_tenant_schema(t, last_posts.get(t.tenant_id)) for t in tenants]
+    )
 
 
 class ProfileResponse(BaseModel):
@@ -614,7 +631,10 @@ async def get_profile(
     отдавали профиль плоско → фронт читал .profile = undefined → форма канала не
     загружала данные с сервера («исчезают после перезагрузки»)."""
     profile = await _require_tenant(principal, tenant_id)
-    return ProfileResponse(profile=_tenant_schema(profile))
+    last_posts = await asyncio.to_thread(get_last_post_times, [tenant_id])
+    return ProfileResponse(
+        profile=_tenant_schema(profile, last_posts.get(tenant_id))
+    )
 
 
 @app.get("/api/admin/tenants/{tenant_id}/avatar", tags=["Tenants"])

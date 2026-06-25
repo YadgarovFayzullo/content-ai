@@ -719,6 +719,27 @@ def remove_tenant_rule(rule_id: int) -> bool:
 # --- История постов ----------------------------------------------------------
 
 
+def get_last_post_times(tenant_ids: List[str]) -> dict:
+    """Время последнего опубликованного (неудалённого) поста по каждому каналу.
+
+    Батч-запрос на список каналов (для списка каналов — без N+1). Возвращает
+    {tenant_id: datetime}; каналы без постов в ответ не попадают."""
+    ids = [t for t in {t for t in tenant_ids} if t]
+    if not ids:
+        return {}
+    from sqlalchemy import func
+
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(PostHistory.tenant_id, func.max(PostHistory.created_at))
+            .where(PostHistory.tenant_id.in_(ids))
+            .where(PostHistory.posted == True)  # noqa: E712
+            .where(PostHistory.deleted == False)  # noqa: E712
+            .group_by(PostHistory.tenant_id)
+        ).all()
+    return {tid: ts for tid, ts in rows if ts}
+
+
 def get_recent_posts(tenant_id: str, limit: int = 5) -> List[PostHistory]:
     with Session(engine, expire_on_commit=False) as session:
         return list(
