@@ -902,6 +902,11 @@ def get_posts_for_metrics(since: datetime) -> List[PostHistory]:
     """Опубликованные посты с message_id, созданные не раньше `since`.
 
     Свежие посты ещё набирают просмотры — их и переснимаем периодически.
+
+    Посты удалённых арендаторов отбрасываем на уровне запроса: их профиль удалён
+    (remove_tenant хранит историю для аудита), снять метрику по ним всё равно
+    нельзя — иначе collect_metrics шумит предупреждениями на каждый осиротевший
+    пост при каждом запуске.
     """
     with Session(engine, expire_on_commit=False) as session:
         return list(
@@ -910,6 +915,9 @@ def get_posts_for_metrics(since: datetime) -> List[PostHistory]:
                 .where(PostHistory.posted == True)  # noqa: E712
                 .where(PostHistory.message_id.is_not(None))
                 .where(PostHistory.created_at >= since)
+                .where(
+                    PostHistory.tenant_id.in_(select(TenantProfile.tenant_id))
+                )
             ).all()
         )
 
