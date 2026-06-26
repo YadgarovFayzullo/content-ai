@@ -1,6 +1,7 @@
 python-dotenv
 aiogram
 aiogram-dialog
+redis
 google-genai
 sqlmodel
 apscheduler

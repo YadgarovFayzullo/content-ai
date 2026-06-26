@@ -26,6 +26,26 @@ services:
     networks:
       - content_ai_net
 
+  # FSM-хранилище диалогов бота (aiogram-dialog). Отдельный контейнер — переживает
+  # рестарты/деплои бота, поэтому кнопки превью/подтверждения не «умирают» после
+  # перезапуска. appendonly — переживает и рестарт самого Redis.
+  redis:
+    image: redis:7-alpine
+    container_name: content_ai_redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - content_ai_net
+
   bot:
     build: .
     container_name: content_ai_bot
@@ -33,9 +53,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres_pass}@db:5432/${DB_NAME:-content_ai}
+      # FSM-хранилище диалогов в Redis (переживает рестарты бота — кнопки живут).
+      - REDIS_URL=redis://redis:6379/0
       # Внутренний API (publish / publish-all / collect-metrics). Бот на bridge-сети,
       # порт 8002 НЕ публикуется — биндим 0.0.0.0 внутри контейнера, снаружи он
       # недостижим, а admin-api ходит по имени `bot:8002` внутри content_ai_net.
@@ -133,3 +157,4 @@ networks:
 
 volumes:
   postgres_data:
+  redis_data:

@@ -1,6 +1,7 @@
 """Точка входа: инициализация бота, подключение роутеров и планировщика."""
 import asyncio
 import logging
+import os
 import sys
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -57,8 +58,32 @@ logging.basicConfig(
     ],
 )
 
+def _make_storage():
+    """FSM-хранилище диалогов. По возможности — Redis (REDIS_URL), иначе память.
+
+    aiogram-dialog держит контекст каждого диалога (превью/подтверждение публикации)
+    в FSM-хранилище. При MemoryStorage любой рестарт бота стирает эти контексты —
+    и кнопки под уже показанными превью «умирают» (UnknownIntent). Redis — отдельный
+    контейнер, переживающий рестарты бота, поэтому кнопки продолжают работать после
+    деплоя. key_builder с with_destiny=True обязателен для aiogram-dialog."""
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        try:
+            from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+
+            storage = RedisStorage.from_url(
+                redis_url, key_builder=DefaultKeyBuilder(with_destiny=True)
+            )
+            logging.info("FSM storage: Redis (%s)", redis_url)
+            return storage
+        except Exception as e:  # redis недоступен/не установлен — не валим бот
+            logging.warning("Redis FSM storage недоступен (%s) — fallback MemoryStorage", e)
+    logging.info("FSM storage: in-memory (кнопки диалогов не переживут рестарт)")
+    return MemoryStorage()
+
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=_make_storage())
 dp.include_router(channels_router)
 # aiogram-dialog: точка входа («⚙️ Sozlamalar» / /v2settings) + сам диалог.
 # setup_dialogs ставит мидлвари DialogManager — вызывать после include всех роутеров.
@@ -71,6 +96,30 @@ dp.include_router(remove_channel_dialog)
 dp.include_router(publish_dialog)
 dp.include_router(post_all_dialog)
 setup_dialogs(dp)
+
+
+@dp.errors()
+async def _on_dialog_error(event) -> bool:
+    """Дружелюбно гасим «протухшие» кнопки диалогов вместо тихого молчания.
+
+    Если контекст диалога не найден/устарел (бот рестартанул, а Redis не настроен,
+    либо запись истекла) — отвечаем на нажатие подсказкой, а не оставляем кнопку
+    «мёртвой». Прочие ошибки пропускаем дальше (логируются как раньше)."""
+    try:
+        from aiogram_dialog.api.exceptions import UnknownIntent, OutdatedIntent
+
+        if isinstance(event.exception, (UnknownIntent, OutdatedIntent)):
+            cq = getattr(event.update, "callback_query", None)
+            if cq:
+                await cq.answer(
+                    "Bu tugma eskirgan. Amalni «⚙️ Sozlamalar» yoki tegishli menyu "
+                    "orqali qaytadan boshlang.",
+                    show_alert=True,
+                )
+            return True  # обработано — не шумим трейсбеком
+    except Exception:
+        pass
+    return False  # остальное — как прежде (aiogram залогирует)
 
 
 async def main():
