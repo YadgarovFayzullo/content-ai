@@ -468,7 +468,7 @@ class ProfileUpdateRequest(BaseModel):
     use_emoji: Optional[bool] = None
     use_hashtags: Optional[bool] = None
     content_mode: Optional[str] = None
-    image_mode: Optional[str] = None  # "ai" | "stock"
+    image_mode: Optional[str] = None  # "ai" | "stock" | "none"
     active: Optional[bool] = None
     # Макс. длина поста (символы). 0 = без жёсткого лимита (дефолтная структура).
     # Это НАСТРОЙКА владельца, не авто-замер: при онбординге канал кладёт сюда
@@ -1126,8 +1126,8 @@ async def update_profile(
         raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
     if "schedule_mode" in update_data and update_data["schedule_mode"] not in ("off", "frequency", "times"):
         raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency' or 'times'")
-    if "image_mode" in update_data and update_data["image_mode"] not in ("ai", "stock"):
-        raise HTTPException(status_code=422, detail="image_mode must be 'ai' or 'stock'")
+    if "image_mode" in update_data and update_data["image_mode"] not in ("ai", "stock", "none"):
+        raise HTTPException(status_code=422, detail="image_mode must be 'ai', 'stock' or 'none'")
     if "avg_post_length" in update_data and update_data["avg_post_length"] is not None:
         # Telegram-пост ≤ 4096 символов; 0 = «без лимита». Зажимаем в диапазон,
         # чтобы случайные/мусорные значения не ломали генерацию.

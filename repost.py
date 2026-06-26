@@ -117,7 +117,12 @@ async def _attach_image(profile, primary: dict, text: str) -> str:
             (нет фото → AI-иллюстрация);
     photo — оригинальное фото источника как есть;
     generate — AI-иллюстрация всегда.
+
+    Канал может быть настроен на посты без фото (profile.image_mode="none") — тогда
+    возвращаем "" независимо от REPOST_IMAGE_MODE.
     """
+    if (getattr(profile, "image_mode", "") or "").lower() == "none":
+        return ""
     mode = REPOST_IMAGE_MODE
 
     # photo: переиспользуем оригинал источника как есть.

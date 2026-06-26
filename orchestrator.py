@@ -150,12 +150,15 @@ def _make_image(profile: TenantProfile, ctx, topic: str, label: str = "") -> str
     """Готовит картинку по image_mode профиля. Возвращает путь к файлу или "".
 
     Источник задаётся профилем:
+      "none"  — без картинки (текстовый пост) — ни ИИ, ни сток;
       "stock" — тематическое фото (Pexels), БЕЗ надписей; запрос строим из ТЕМЫ
                 (общий вид места: skyline/cityscape/landmark), а не из текста поста;
       "ai" (по умолчанию) — ИИ-иллюстрация.
     Картинка необязательна: при сбое возвращаем "" (текстовый пост), а не валим всё.
     Общий код для автопостинга и превью."""
     image_mode = (getattr(profile, "image_mode", "ai") or "ai").lower()
+    if image_mode == "none":
+        return ""  # канал настроен на посты без фото
     image_path = ""
     if image_mode == "stock":
         try:
@@ -187,7 +190,11 @@ def generate_for_tenant(profile: TenantProfile, with_image: bool = True) -> Gene
     ctx = build_generation_context(profile.tenant_id, topic)
     if ctx is None:
         raise RuntimeError("Tenant profili topilmadi")
-    ctx.with_image = with_image
+    # image_mode="none" → пост без фото: не тратим вызов генерации картинки и пишем
+    # текст полной длины (не урезаем под подпись к фото).
+    image_off = (getattr(profile, "image_mode", "ai") or "ai").lower() == "none"
+    wants_image = with_image and not image_off
+    ctx.with_image = wants_image
 
     # Все темы уже освещены (тема вынужденно повторяется) → подаём прошлые посты по
     # этой теме как «уже опубликовано», чтобы движок выдал заведомо другой угол.
@@ -208,7 +215,7 @@ def generate_for_tenant(profile: TenantProfile, with_image: bool = True) -> Gene
 
     # Без картинки (тариф/ручная публикация её запрещают) не тратим дорогой вызов
     # генерации изображения — пост уйдёт текстом.
-    image_path = _make_image(profile, ctx, topic, label=profile.chat_id) if with_image else ""
+    image_path = _make_image(profile, ctx, topic, label=profile.chat_id) if wants_image else ""
 
     entry = PostHistory(
         tenant_id=profile.tenant_id,
@@ -250,6 +257,9 @@ def generate_preview(
     ctx = build_generation_context(tenant_id, chosen_topic)
     if ctx is None:
         raise RuntimeError("Tenant profili topilmadi")
+
+    # image_mode="none" → превью без фото и текст полной длины (как и в автопостинге).
+    ctx.with_image = (getattr(profile, "image_mode", "ai") or "ai").lower() != "none"
 
     # Прошлые посты по этой теме → «уже опубликовано» (анти-повтор сюжета/фактов).
     if forced_repeat:
