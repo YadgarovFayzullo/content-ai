@@ -857,6 +857,17 @@ def _md_to_html(text: str) -> str:
     text = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", text)
     # Подчищаем осиротевшие маркеры, если остались.
     text = text.replace("**", "").replace("__", "")
+
+    # Telegram parse_mode=HTML поддерживает лишь узкий набор тегов (b/i/u/s/a/code/
+    # pre/blockquote/…). Модель порой выдаёт <br> и блочные теги (<p>,<div>,<ul>,
+    # <li>,<h1-6>) — с ними send_message падает с «Unsupported start tag», и пост
+    # ВООБЩЕ не публикуется. Нормализуем их в переносы строк / <b>, текст сохраняем.
+    text = re.sub(r"(?is)<\s*h([1-6])\b[^>]*>(.*?)<\s*/\s*h\1\s*>", r"<b>\2</b>", text)
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)<\s*li\b[^>]*>", "\n• ", text)
+    # Прочие неподдерживаемые блочные теги (открывающие/закрывающие) → перенос строки.
+    text = re.sub(r"(?i)<\s*/?\s*(p|div|ul|ol|h[1-6]|span|tr|td|table|section|article)\b[^>]*>", "\n", text)
+    text = re.sub(r"(?i)<\s*/\s*li\s*>", "", text)
     return text
 
 
