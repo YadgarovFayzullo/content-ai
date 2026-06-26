@@ -23,7 +23,7 @@ import re
 from typing import List, Optional
 
 from bot.rag_client import embed_texts
-from bot.scraper import download_post_image, scrape_channel_history
+from bot.scraper import download_post_image, scrape_source
 from clustering import centroid, cluster_indices, is_duplicate_story
 from context_builder import GenerationContext, RuleView
 from news_card import render_news_card
@@ -173,7 +173,7 @@ async def _gather_candidates(profile) -> List[dict]:
 
     candidates: List[dict] = []
     for s in sources:
-        posts = await scrape_channel_history(s.source_chat_id, limit=REPOST_FETCH_LIMIT)
+        posts = await scrape_source(s.source_chat_id, limit=REPOST_FETCH_LIMIT)
         for p in posts:
             p["source_chat_id"] = s.source_chat_id
             p["priority"] = s.priority
