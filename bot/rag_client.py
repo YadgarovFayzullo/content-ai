@@ -16,30 +16,48 @@ import httpx
 from bot.config import RAG_URL
 
 
+# Веб-источники дают длинные посты (полные статьи), которые RAG режет на много
+# чанков и эмбеддит через ollama на CPU — пачка из десятков таких постов не
+# укладывается в таймаут одним запросом. Поэтому шлём небольшими батчами: каждый
+# запрос лёгкий, прогресс копится, частичный сбой не теряет уже проиндексированное.
+_INDEX_BATCH = int(os.getenv("RAG_INDEX_BATCH", "5"))
+_INDEX_TIMEOUT = float(os.getenv("RAG_INDEX_TIMEOUT", "300"))
+
+
 async def index_posts(
     tenant_id: str, posts: list[dict[str, Any]], is_reference: bool = False
 ) -> int:
     """Шлёт посты канала в RAG-сервис на индексацию. Возвращает число чанков.
 
     is_reference=True — посты референс-канала (отдельная квота в retrieval).
+
+    Посты отправляются батчами (`RAG_INDEX_BATCH`): длинный веб-контент не успевал
+    проиндексироваться одним запросом и валился по таймауту. Сбой батча логируется,
+    но не прерывает остальные — возвращается сумма успешно проиндексированных чанков.
     """
     if not posts:
         return 0
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{RAG_URL}/index",
-                json={
-                    "tenant_id": tenant_id,
-                    "posts": posts,
-                    "is_reference": is_reference,
-                },
-            )
-            resp.raise_for_status()
-            return int(resp.json().get("indexed", 0))
-    except Exception as e:
-        logging.error(f"RAG /index xatosi ({tenant_id}): {e}")
-        return 0
+    total = 0
+    async with httpx.AsyncClient(timeout=_INDEX_TIMEOUT) as client:
+        for start in range(0, len(posts), _INDEX_BATCH):
+            batch = posts[start:start + _INDEX_BATCH]
+            try:
+                resp = await client.post(
+                    f"{RAG_URL}/index",
+                    json={
+                        "tenant_id": tenant_id,
+                        "posts": batch,
+                        "is_reference": is_reference,
+                    },
+                )
+                resp.raise_for_status()
+                total += int(resp.json().get("indexed", 0))
+            except Exception as e:
+                logging.error(
+                    "RAG /index xatosi (%s, batch %d-%d): %s: %s",
+                    tenant_id, start, start + len(batch), type(e).__name__, e,
+                )
+    return total
 
 
 async def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
