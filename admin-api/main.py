@@ -470,6 +470,10 @@ class ProfileUpdateRequest(BaseModel):
     content_mode: Optional[str] = None
     image_mode: Optional[str] = None  # "ai" | "stock"
     active: Optional[bool] = None
+    # Макс. длина поста (символы). 0 = без жёсткого лимита (дефолтная структура).
+    # Это НАСТРОЙКА владельца, не авто-замер: при онбординге канал кладёт сюда
+    # медиану длины постов, но дальше значение редактируется только владельцем.
+    avg_post_length: Optional[int] = None
     # Стиль/рубрика контента (topic-режим). post_template — шаблон/рубрика поста
     # (напр. «ТОП-5 фактов о стране»), движок следует ему дословно.
     writing_style: Optional[str] = None
@@ -1124,6 +1128,10 @@ async def update_profile(
         raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency' or 'times'")
     if "image_mode" in update_data and update_data["image_mode"] not in ("ai", "stock"):
         raise HTTPException(status_code=422, detail="image_mode must be 'ai' or 'stock'")
+    if "avg_post_length" in update_data and update_data["avg_post_length"] is not None:
+        # Telegram-пост ≤ 4096 символов; 0 = «без лимита». Зажимаем в диапазон,
+        # чтобы случайные/мусорные значения не ломали генерацию.
+        update_data["avg_post_length"] = max(0, min(int(update_data["avg_post_length"]), 4096))
 
     _enforce_profile_tier(principal, profile.subscription_tier, update_data)
 
