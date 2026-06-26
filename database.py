@@ -1234,7 +1234,9 @@ def materialize_weekly_plan(
                 )
                 session.add(row)
                 created.append(row)
-        profile = session.get(TenantProfile, tenant_id)
+        profile = session.exec(
+            select(TenantProfile).where(TenantProfile.tenant_id == tenant_id)
+        ).first()
         if profile is not None:
             profile.schedule_mode = "weekly"
             session.add(profile)
@@ -1264,7 +1266,9 @@ def clear_schedule_plan(tenant_id: str) -> None:
             select(SchedulePlanSlot).where(SchedulePlanSlot.tenant_id == tenant_id)
         ).all():
             session.delete(old)
-        profile = session.get(TenantProfile, tenant_id)
+        profile = session.exec(
+            select(TenantProfile).where(TenantProfile.tenant_id == tenant_id)
+        ).first()
         if profile is not None:
             profile.schedule_mode = "off"
             session.add(profile)

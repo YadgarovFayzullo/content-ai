@@ -90,6 +90,7 @@ from tiers import (
     BASIC_ANALYTICS_MAX_DAYS,
     allows,
     best_tier,
+    is_unlimited,
     limit_of,
     limits_for,
     normalize_tier,
