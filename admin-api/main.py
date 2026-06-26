@@ -58,6 +58,7 @@ from database import (
     get_published_posts_since,
     get_schedule_plan,
     replace_schedule_plan,
+    materialize_weekly_plan,
     get_last_post_times,
     get_tenant_stats,
     get_tenants_for_owner,
@@ -1149,6 +1150,28 @@ def _legacy_post_times(profile: TenantProfile, tier: str) -> List[str]:
     return []
 
 
+def _ensure_weekly_migrated(profile: TenantProfile, slots: list) -> list:
+    """Бесшовная миграция legacy-канала в недельную сетку при чтении из дашборда.
+
+    Если канал ещё на legacy-режиме (frequency/times) и сетка пуста — разворачиваем
+    его времена на все 7 дней (тип = content_mode), ровно как это делает бот, чтобы
+    бот и дашборд видели одно расписание. Возвращает актуальные слоты.
+    """
+    if slots:
+        return slots
+    if (profile.schedule_mode or "off") not in ("frequency", "times"):
+        return slots
+    tier = getattr(profile, "subscription_tier", None)
+    ltimes = _legacy_post_times(profile, tier)
+    if not ltimes:
+        return slots
+    materialize_weekly_plan(
+        profile.tenant_id, ltimes, profile.content_mode or "topic"
+    )
+    profile.schedule_mode = "weekly"
+    return get_schedule_plan(profile.tenant_id)
+
+
 def _parse_range(date_from: str, date_to: str) -> tuple[date, date]:
     """Парсит from/to (YYYY-MM-DD); валидирует диапазон (≤ 92 дня — квартал)."""
     try:
@@ -1177,8 +1200,9 @@ async def get_schedule(
     principal: Principal = Depends(get_principal),
 ) -> SchedulePlanResponse:
     """Недельная сетка слотов канала (weekly grid)."""
-    await _require_tenant(principal, tenant_id)
+    profile = await _require_tenant(principal, tenant_id)
     slots = await asyncio.to_thread(get_schedule_plan, tenant_id)
+    slots = await asyncio.to_thread(_ensure_weekly_migrated, profile, slots)
     return SchedulePlanResponse(
         slots=[
             WeekdaySlotSchema(
@@ -1336,6 +1360,7 @@ async def get_tenant_calendar(
     profile = await _require_tenant(principal, tenant_id)
     d0, d1 = _parse_range(date_from, date_to)
     slots = await asyncio.to_thread(get_schedule_plan, tenant_id)
+    slots = await asyncio.to_thread(_ensure_weekly_migrated, profile, slots)
     since = datetime.combine(d0, datetime.min.time(), tzinfo=_SCHED_TZ)
     posts = await asyncio.to_thread(get_published_posts_since, tenant_id, since)
     days = _project_calendar(
@@ -1362,6 +1387,7 @@ async def get_global_calendar(
     channels: List[CalendarChannelSchema] = []
     for profile in tenants:
         slots = await asyncio.to_thread(get_schedule_plan, profile.tenant_id)
+        slots = await asyncio.to_thread(_ensure_weekly_migrated, profile, slots)
         posts = await asyncio.to_thread(get_published_posts_since, profile.tenant_id, since)
         days = _project_calendar(
             profile, slots, posts, d0, d1,

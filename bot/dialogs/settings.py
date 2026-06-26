@@ -30,11 +30,14 @@ from bot.scraper import scrape_source
 from database import (
     add_tenant_rule,
     add_tenant_source,
+    clear_schedule_plan,
     get_tenant_profile,
     get_tenant_rules,
     get_tenant_sources,
+    materialize_weekly_plan,
     remove_tenant_rule,
     remove_tenant_source,
+    set_plan_content_type,
     set_tenant_source_priority,
     update_tenant_profile,
 )
@@ -117,6 +120,9 @@ async def on_toggle_mode(callback, button, dialog_manager: DialogManager):
     cur = profile.content_mode or "topic"
     new_mode = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "repost"
     await asyncio.to_thread(update_tenant_profile, tid, content_mode=new_mode)
+    # Reflow: тип всех слотов недельной сетки следует за content_mode (единый
+    # «один тумблер» как в боте). Дашборд-кастомизация при этом тоже выровняется.
+    await asyncio.to_thread(set_plan_content_type, tid, new_mode)
     labels = {
         "topic": "Topik rejimi (original)",
         "repost": "Repost rejimi (manbalardan)",
@@ -399,11 +405,32 @@ async def schedule_getter(dialog_manager: DialogManager, **kwargs):
     return {"schedule_text": render_schedule_text(profile)}
 
 
+def _rebuild_plan_from_legacy(tid: str) -> None:
+    """После изменения легаси-полей (частота/времена) разворачивает их в недельную
+    сетку: те же времена на все 7 дней, тип = content_mode. force=True — явное
+    изменение расписания всегда пересоздаёт сетку. Сетка становится единственным
+    живым источником расписания (schedule_mode="weekly")."""
+    from bot.scheduler import tenant_post_times
+
+    profile = get_tenant_profile(tid)
+    if not profile:
+        return
+    times = tenant_post_times(profile)
+    if not times:
+        clear_schedule_plan(tid)
+        return
+    materialize_weekly_plan(
+        tid, times, profile.content_mode or "topic", force=True
+    )
+
+
 async def on_sched_off(callback, button, dialog_manager: DialogManager):
     tid = await _tenant_id(dialog_manager)
     if not tid:
         return await callback.answer("Sessiya tugadi")
-    await asyncio.to_thread(update_tenant_profile, tid, schedule_mode="off")
+    # Чистим недельную сетку и переводим в "off" (сетка — единственный живой
+    # источник расписания).
+    await asyncio.to_thread(clear_schedule_plan, tid)
     await callback.answer("Jadval o'chirildi")
 
 
@@ -422,6 +449,7 @@ async def on_frequency_input(
     await asyncio.to_thread(
         update_tenant_profile, tid, schedule_mode="frequency", posts_per_day=int(raw)
     )
+    await asyncio.to_thread(_rebuild_plan_from_legacy, tid)
     await message.answer("✅ Jadval saqlandi.")
     await dialog_manager.switch_to(SettingsSG.schedule)
 
@@ -459,6 +487,7 @@ async def on_times_input(
     await asyncio.to_thread(
         update_tenant_profile, tid, schedule_mode="times", post_times=times_str
     )
+    await asyncio.to_thread(_rebuild_plan_from_legacy, tid)
     await message.answer("✅ Jadval saqlandi.")
     await dialog_manager.switch_to(SettingsSG.schedule)
 

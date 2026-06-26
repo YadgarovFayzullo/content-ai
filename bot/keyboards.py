@@ -47,9 +47,35 @@ def render_sources_text(sources) -> str:
 
 def render_schedule_text(profile: TenantProfile) -> str:
     from bot.scheduler import tenant_post_times
+    from database import get_schedule_plan
 
     mode = profile.schedule_mode or "off"
-    if mode == "off":
+
+    if mode == "weekly":
+        # Недельная сетка — единственный живой источник расписания. Если она
+        # одинакова во все 7 дней (как задаёт бот) — показываем привычную сводку;
+        # если дни отличаются (кастомизация из дашборда) — отдельная подсказка.
+        slots = [s for s in get_schedule_plan(profile.tenant_id) if s.enabled]
+        if not slots:
+            cur = "⏸ <b>O'chirilgan</b> — avtomatik post chiqmaydi."
+        else:
+            by_day: dict[int, list[str]] = {}
+            for s in slots:
+                by_day.setdefault(s.weekday, []).append(s.time)
+            day_sets = {tuple(sorted(v)) for v in by_day.values()}
+            if len(day_sets) == 1 and len(by_day) == 7:
+                times = ", ".join(sorted(day_sets.pop())) or "—"
+                cur = (
+                    f"🔢 Kuniga <b>{len(by_day[0])}</b> marta\n"
+                    f"Vaqtlar: <code>{times}</code>"
+                )
+            else:
+                all_times = ", ".join(sorted({s.time for s in slots})) or "—"
+                cur = (
+                    "🗓 <b>Dashboard'da sozlangan</b> (kunlar bo'yicha har xil)\n"
+                    f"Vaqtlar: <code>{all_times}</code>"
+                )
+    elif mode == "off":
         cur = "⏸ <b>O'chirilgan</b> — avtomatik post chiqmaydi."
     elif mode == "frequency":
         times = ", ".join(tenant_post_times(profile)) or "—"

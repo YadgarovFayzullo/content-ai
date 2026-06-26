@@ -1198,6 +1198,79 @@ def replace_schedule_plan(tenant_id: str, slots: List[dict]) -> List["SchedulePl
         return created
 
 
+def materialize_weekly_plan(
+    tenant_id: str,
+    times: List[str],
+    content_type: str = "topic",
+    *,
+    force: bool = False,
+) -> List["SchedulePlanSlot"]:
+    """Разворачивает легаси-расписание (`times` — список "HH:MM") в недельную
+    сетку: те же времена на все 7 дней недели, тип слота = content_type. Также
+    переводит профиль в schedule_mode="weekly".
+
+    По умолчанию идемпотентна: если сетка уже существует — ничего не делает
+    (чтобы не затереть кастомизацию из дашборда). `force=True` пересоздаёт сетку
+    (бот при явном изменении расписания). Возвращает актуальную сетку.
+    """
+    times = [t for t in times if t]
+    with Session(engine, expire_on_commit=False) as session:
+        existing = session.exec(
+            select(SchedulePlanSlot).where(SchedulePlanSlot.tenant_id == tenant_id)
+        ).all()
+        if existing and not force:
+            return list(existing)
+        for old in existing:
+            session.delete(old)
+        created: List[SchedulePlanSlot] = []
+        for weekday in range(7):
+            for t in times:
+                row = SchedulePlanSlot(
+                    tenant_id=tenant_id,
+                    weekday=weekday,
+                    time=t,
+                    content_type=content_type,
+                    enabled=True,
+                )
+                session.add(row)
+                created.append(row)
+        profile = session.get(TenantProfile, tenant_id)
+        if profile is not None:
+            profile.schedule_mode = "weekly"
+            session.add(profile)
+        session.commit()
+        return created
+
+
+def set_plan_content_type(tenant_id: str, content_type: str) -> int:
+    """Перезаписывает content_type у всех слотов сетки канала (reflow при смене
+    content_mode в боте). Возвращает число обновлённых слотов."""
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.exec(
+            select(SchedulePlanSlot).where(SchedulePlanSlot.tenant_id == tenant_id)
+        ).all()
+        for row in rows:
+            row.content_type = content_type
+            session.add(row)
+        session.commit()
+        return len(rows)
+
+
+def clear_schedule_plan(tenant_id: str) -> None:
+    """Удаляет всю недельную сетку канала и переводит профиль в schedule_mode="off"
+    (кнопка «⏸ Отключить» в боте)."""
+    with Session(engine, expire_on_commit=False) as session:
+        for old in session.exec(
+            select(SchedulePlanSlot).where(SchedulePlanSlot.tenant_id == tenant_id)
+        ).all():
+            session.delete(old)
+        profile = session.get(TenantProfile, tenant_id)
+        if profile is not None:
+            profile.schedule_mode = "off"
+            session.add(profile)
+        session.commit()
+
+
 def get_top_posts(tenant_id: str, limit: int = 3) -> List[str]:
     """Тексты самых «зашедших» постов канала — образцы для few-shot генерации.
 

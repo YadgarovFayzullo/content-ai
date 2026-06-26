@@ -26,6 +26,7 @@ from database import (
     get_all_tenants,
     get_schedule_plan,
     get_tenant_sources,
+    materialize_weekly_plan,
     purge_schedule_slots_before,
     release_schedule_slot,
 )
@@ -92,7 +93,23 @@ def tenant_due_slots(profile: TenantProfile, now_hhmm: str, weekday: int):
     if not allows(tier, "scheduling"):
         return []
 
-    if (profile.schedule_mode or "off") == "weekly":
+    mode = profile.schedule_mode or "off"
+
+    # Легаси-режимы (frequency/times) бесшовно мигрируем в недельную сетку:
+    # те же времена на все 7 дней, тип = profile.content_mode. После этого канал
+    # становится "weekly", и единственный живой источник расписания — сетка.
+    if mode in ("frequency", "times"):
+        ltimes = tenant_post_times(profile)
+        if ltimes:
+            materialize_weekly_plan(
+                profile.tenant_id, ltimes, profile.content_mode or "topic"
+            )
+            profile.schedule_mode = "weekly"
+            mode = "weekly"
+        else:
+            return []
+
+    if mode == "weekly":
         slots = get_schedule_plan(profile.tenant_id)
         day_slots = [
             s for s in slots if s.weekday == weekday and s.enabled
@@ -104,8 +121,7 @@ def tenant_due_slots(profile: TenantProfile, now_hhmm: str, weekday: int):
             day_slots = day_slots[:max_ppd]
         return [(s.time, s.content_type) for s in day_slots if s.time == now_hhmm]
 
-    # Легаси-режимы: тип не задан (берётся из profile.content_mode).
-    return [(t, None) for t in tenant_post_times(profile) if t == now_hhmm]
+    return []
 
 
 async def _publish_due(
