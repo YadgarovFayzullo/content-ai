@@ -271,9 +271,16 @@ CORE RULES
    "ru, uz"), the channel is multilingual — write each post in the language that
    best fits the topic, matching the mix seen in the channel (a post may be in
    one language, or bilingual, as the channel does).
-8. Match `target_length_chars` (the channel's typical post length): aim within
-   ±30% of it. If unset, use the default structure length. Never pad with filler
-   to hit the number — concision beats length.
+8. `max_length_chars` is a HARD CEILING on the READABLE text of the WHOLE post —
+   count visible characters the reader sees (text, emoji, hashtags, CTA); HTML
+   tags like <b>/<i>/<a> do NOT count. The finished post MUST NOT exceed it. It is
+   a strict maximum, not a target: shorter is always fine, never pad with filler
+   to approach it. When the ceiling is small (≤ ~250 chars) it OVERRIDES the
+   DEFAULT STRUCTURE and DEPTH guidance below — write a single tight hook plus at
+   most one short sentence, NO bullet list, NO extra paragraphs, and drop
+   hashtags/CTA if they don't fit. Keep well under the ceiling and cut whole
+   sentences (never mid-sentence) until you fit. If unset, use the default
+   structure length.
 
 CREATIVITY LEVEL
 - low  -> factual, structured, minimal variation
@@ -310,6 +317,8 @@ EMOJI DISCIPLINE
 DEPTH
 - A post is substance, not a hype slogan. Write 2–4 short paragraphs of real,
   useful content (an insight, explanation or takeaway), not one promotional line.
+- EXCEPTION: a small `max_length_chars` ceiling overrides this — when the post
+  must stay very short, deliver one sharp, useful sentence instead of paragraphs.
 
 LIST / BULLET VARIETY (critical)
 - When the post has a numbered or bulleted list, EVERY item MUST open differently.
@@ -394,7 +403,8 @@ def _build_user_context(ctx: GenerationContext) -> str:
             f"audience: {p.audience or '(general)'}",
             f"post_template: {p.post_template or '(none — use default structure)'}",
             f"cta: {p.cta or '(none — no link/contact in post)'}",
-            f"target_length_chars: {p.avg_post_length or '(unset — use default structure length)'}",
+            f"max_length_chars: {p.avg_post_length or '(unset — use default structure length)'} "
+            f"{'(HARD MAXIMUM — readable text of the whole post MUST be at or under this character count; HTML tags do not count)' if p.avg_post_length else ''}",
             f"creativity_level: {p.creativity_level}",
             f"factual_strictness: {p.factual_strictness}",
             "",
@@ -659,6 +669,89 @@ def _strip_repeated_subject(text: str, subject: str) -> str:
     return "\n".join(lines)
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _visible_text(html: str) -> str:
+    """Видимый текст поста: без HTML-тегов и с раскодированными HTML-сущностями.
+    Именно его длину видит читатель в Telegram (теги <b>/<i>/<a> не показываются),
+    поэтому max_length_chars меряем по нему, а не по «сырой» строке с разметкой."""
+    import html as _html_mod
+
+    return _html_mod.unescape(_TAG_RE.sub("", html or "")).strip()
+
+
+def _truncate_to_limit(post: str, ceiling: int) -> str:
+    """Жёсткая гарантия лимита (последний рубеж, если ретраи не уложились): срезаем
+    видимый текст до `ceiling` символов по границе предложения, иначе слова. HTML-
+    разметку при срезе теряем — это крайний случай, важнее не превысить лимит."""
+    plain = _visible_text(post)
+    if len(plain) <= ceiling:
+        return post
+    cut = plain[:ceiling]
+    # Предпочитаем конец предложения в пределах лимита…
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("\n"))
+    for mark in (".", "!", "?", "…"):
+        end = max(end, cut.rfind(mark))
+    if end >= ceiling * 0.5:
+        return cut[: end + 1].strip()
+    # …иначе по границе слова.
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp >= ceiling * 0.5 else cut).strip()
+
+
+def _enforce_max_length(
+    ctx: GenerationContext,
+    post: str,
+    user_context: str,
+    history: List[dict],
+    temperature: float,
+) -> str:
+    """Детерминированно держит пост в пределах max_length_chars (профильный
+    avg_post_length). Промпт-инструкция при малом лимите ненадёжна — модель не умеет
+    считать символы. Поэтому: меряем видимую длину; если превышена — перегенерируем
+    до 2 раз с КОНКРЕТНОЙ обратной связью (было N, лимит C) и берём самый короткий
+    валидный вариант; если и тогда длинно — жёстко срезаем."""
+    ceiling = int(getattr(ctx.profile, "avg_post_length", 0) or 0)
+    if ceiling <= 0 or len(_visible_text(post)) <= ceiling:
+        return post
+
+    best = post
+    for attempt in range(2):
+        cur_len = len(_visible_text(best))
+        if cur_len <= ceiling:
+            return best
+        directive = (
+            "## LENGTH LIMIT — HARD REQUIREMENT (read this FIRST)\n"
+            f"A previous attempt FAILED this rule: it was {cur_len} characters of "
+            f"readable text, but the HARD limit is {ceiling} characters (readable text "
+            "only — HTML tags don't count). Rewrite the WHOLE post to fit within "
+            f"{ceiling} characters — shorter is always fine, never pad to fill it. Keep "
+            "ONLY the single most important point: one tight hook plus at most one short "
+            "sentence. NO bullet list, NO extra paragraphs; drop hashtags and CTA if "
+            "they don't fit. Output only the post.\n\n"
+        )
+        try:
+            retry = groq_chat(
+                SYSTEM_PROMPT,
+                directive + user_context,
+                temperature=max(0.2, temperature - 0.1),
+                history=history,
+            ).strip()
+        except Exception:
+            break  # сбой ретрая — оставляем лучшее найденное
+        retry_post = _sanitize_post(retry, ctx) if retry else ""
+        if not retry_post:
+            continue
+        retry_post = _strip_repeated_subject(retry_post, ctx.topic)
+        if len(_visible_text(retry_post)) < len(_visible_text(best)):
+            best = retry_post
+
+    if len(_visible_text(best)) <= ceiling:
+        return best
+    return _truncate_to_limit(best, ceiling)
+
+
 def generate_post(ctx: GenerationContext) -> str:
     """Генерирует готовый текст поста. Бросает RuntimeError при сбое."""
     user_context = _build_user_context(ctx)
@@ -724,6 +817,10 @@ def generate_post(ctx: GenerationContext) -> str:
         # программно, модель-независимо. Вне ретрай-блока: чистим зачины-имена даже
         # когда первые СЛОВА формально разные ('Новую…' / 'В Новой…') и score<2.
         post = _strip_repeated_subject(post, ctx.topic)
+
+        # Жёсткий потолок длины (max_length_chars): перегенерация с обратной связью
+        # и срез как последний рубеж. Промпт сам по себе лимит не держит.
+        post = _enforce_max_length(ctx, post, user_context, history, temperature)
 
         return post
     except Exception as e:
@@ -825,7 +922,10 @@ WHAT TO DO
 2. Adapt to the channel's `tone`, `writing_style` and `audience`. Restructure into
    a clean Telegram post (hook line + 1–3 short paragraphs + takeaway). Do not copy
    the source's sentence structure verbatim — rewrite it as this channel would.
-3. Match `target_length_chars` within ±30% if provided.
+3. `max_length_chars` (if provided) is a HARD CEILING on the READABLE text of the
+   whole post (HTML tags don't count) — the finished post MUST be at or under it.
+   When it is small, collapse to a single tight sentence and drop the
+   bullet/paragraph structure.
 
 STRICT RULES
 - The source is THIRD-PARTY. Never speak in the source channel's first person
@@ -953,7 +1053,8 @@ def _repost_profile_lines(profile) -> List[str]:
         "emojis, NO calls to action",
         "audience: (general)",
         f"cta: {profile.cta or '(none — no link/contact in post)'}",
-        f"target_length_chars: {profile.avg_post_length or '(unset)'}",
+        f"max_length_chars: {profile.avg_post_length or '(unset)'} "
+        f"{'(HARD MAXIMUM — readable text of the whole post MUST be at or under this character count; HTML tags do not count)' if profile.avg_post_length else ''}",
     ]
 
 
@@ -982,11 +1083,16 @@ def _do_llm(system: str, user: str) -> str:
     return text
 
 
-def _generate_with_lang_lock(system: str, base_user: str, language: str) -> str:
+def _generate_with_lang_lock(
+    system: str, base_user: str, language: str, max_chars: int = 0
+) -> str:
     """Вызов LLM + языковой замок. llama-4-scout порой echo'ит язык источника
     (русский) или оставляет кириллицу при узбекском выводе. Если целевой язык
     латинский, а в результате есть кириллица — одна повторная попытка с более
-    жёсткой директивой; берём вариант с меньшей «протечкой». Возвращает HTML."""
+    жёсткой директивой; берём вариант с меньшей «протечкой». Возвращает HTML.
+
+    max_chars (если > 0) — жёсткий потолок длины видимого текста: перегенерация с
+    конкретной обратной связью и срез как последний рубеж (промпт сам не держит)."""
     text = _do_llm(system, base_user)
     if _target_is_latin(language) and _has_cyrillic(text):
         stricter = base_user + (
@@ -1001,14 +1107,43 @@ def _generate_with_lang_lock(system: str, base_user: str, language: str) -> str:
                 text = retry
         except Exception:
             pass  # сбой повтора — оставляем первый вариант
-    return _md_to_html(_strip_leading_greeting(text))
+
+    post = _md_to_html(_strip_leading_greeting(text))
+
+    ceiling = int(max_chars or 0)
+    if ceiling > 0 and len(_visible_text(post)) > ceiling:
+        for _ in range(2):
+            cur_len = len(_visible_text(post))
+            if cur_len <= ceiling:
+                break
+            directive = base_user + (
+                "\n\n## LENGTH LIMIT — HARD REQUIREMENT\n"
+                f"The previous attempt was {cur_len} characters of readable text, but "
+                f"the HARD limit is {ceiling} characters (readable text only — HTML tags "
+                f"don't count). Rewrite to fit within {ceiling} characters: keep ONLY the "
+                "single most important point, drop the bullet list / extra paragraphs / "
+                "hashtags / CTA if they don't fit. Shorter is fine; never pad."
+            )
+            try:
+                retry = _md_to_html(_strip_leading_greeting(_do_llm(system, directive)))
+            except Exception:
+                break
+            if retry and len(_visible_text(retry)) < len(_visible_text(post)):
+                post = retry
+        if len(_visible_text(post)) > ceiling:
+            post = _truncate_to_limit(post, ceiling)
+
+    return post
 
 
 def rewrite_source_post(profile, source_text: str, rules: List[RuleView]) -> str:
     """Переписывает ОДИН чужой пост под стиль/язык канала. Бросает RuntimeError."""
     base_user = _build_repost_user(profile, source_text, rules)
     try:
-        return _generate_with_lang_lock(REPOST_REWRITE_PROMPT, base_user, profile.language)
+        return _generate_with_lang_lock(
+            REPOST_REWRITE_PROMPT, base_user, profile.language,
+            max_chars=int(getattr(profile, "avg_post_length", 0) or 0),
+        )
     except Exception as e:
         raise RuntimeError(f"Postni qayta yozib bo'lmadi: {e}")
 
@@ -1090,7 +1225,10 @@ def canonicalize_cluster(
         return rewrite_source_post(profile, members[0] if members else "", rules)
     base_user = _build_canon_user(profile, members, rules)
     try:
-        return _generate_with_lang_lock(CANONICALIZE_PROMPT, base_user, profile.language)
+        return _generate_with_lang_lock(
+            CANONICALIZE_PROMPT, base_user, profile.language,
+            max_chars=int(getattr(profile, "avg_post_length", 0) or 0),
+        )
     except Exception as e:
         raise RuntimeError(f"Klasterni birlashtirib bo'lmadi: {e}")
 
