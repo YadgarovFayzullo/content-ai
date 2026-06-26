@@ -141,6 +141,37 @@ async def handle_collect_metrics(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "saved": saved})
 
 
+async def handle_channel_posts(request: web.Request) -> web.Response:
+    """GET /internal/tenants/{tenant_id}/channel-posts?limit=10
+
+    Последние посты САМОГО канала (живой скрейп через Telethon). Нужно
+    аналитическому агенту: даже если наш сервис в этом канале ещё ничего не
+    публиковал, агенту есть что «прочитать» — реальные посты канала. Форварды
+    отсеиваем (это чужой контент), берём только посты с текстом.
+    """
+    _check_auth(request)
+    tenant_id = request.match_info["tenant_id"]
+    try:
+        limit = max(1, min(int(request.query.get("limit", "10")), 50))
+    except (TypeError, ValueError):
+        limit = 10
+
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise web.HTTPNotFound(reason="tenant not found")
+
+    from bot.scraper import scrape_channel_history
+
+    # Сканируем с запасом (пропускаем форварды/пустые), затем берём limit постов.
+    raw = await scrape_channel_history(profile.chat_id, limit=max(limit * 3, 30))
+    posts = [
+        {"id": p.get("id"), "text": p.get("text"), "date": p.get("date")}
+        for p in raw
+        if (p.get("text") or "").strip() and not p.get("is_forward")
+    ][:limit]
+    return web.json_response({"posts": posts})
+
+
 async def handle_index_source(request: web.Request) -> web.Response:
     """POST /internal/tenants/{tenant_id}/index-source  Body {source}
 
@@ -179,6 +210,10 @@ def create_internal_app(bot: Bot) -> web.Application:
     app.router.add_post("/internal/publish-all", handle_publish_all)
     app.router.add_post(
         "/internal/tenants/{tenant_id}/index-source", handle_index_source
+    )
+    # Живой скрейп последних постов канала — для «чтения» аналитическим агентом.
+    app.router.add_get(
+        "/internal/tenants/{tenant_id}/channel-posts", handle_channel_posts
     )
     app.router.add_post(
         "/internal/tenants/{tenant_id}/collect-metrics", handle_collect_metrics

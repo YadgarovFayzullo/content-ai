@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -48,6 +49,45 @@ _FORECAST_HIGH = 0.9
 # видел заголовок/зачин/структуру/CTA, не раздувая промпт всем каналом.
 _POSTS_SAMPLE_MAX = 12
 _POST_CONTENT_TRUNCATE = 700
+
+# Фолбэк-чтение: если наш сервис в канале ещё ничего не публиковал, агенту всё
+# равно нужно что читать — берём последние посты САМОГО канала живым скрейпом
+# через внутренний API бота (единственный владелец Telethon-сессии).
+_CHANNEL_POSTS_FALLBACK = 10
+_INTERNAL_BOT_URL = os.getenv("INTERNAL_BOT_URL", "http://bot:8002")
+_INTERNAL_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+def _live_channel_posts(tenant_id: str, limit: int = _CHANNEL_POSTS_FALLBACK) -> List[dict]:
+    """Последние посты самого канала (живой скрейп через бот). Best-effort: при
+    любой ошибке/недоступности бота — пустой список (аналитика не падает).
+
+    Возвращает [{"text", "date"}] — текст без метрик (это посты канала, не наши;
+    просмотров/реакций по ним у нас нет), обрезанный до _POST_CONTENT_TRUNCATE."""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.get(
+                f"{_INTERNAL_BOT_URL}/internal/tenants/{tenant_id}/channel-posts",
+                params={"limit": limit},
+                headers={"X-Internal-Token": _INTERNAL_TOKEN},
+            )
+            r.raise_for_status()
+            raw = r.json().get("posts", [])
+    except Exception as e:
+        logging.warning("Не удалось получить живые посты канала (%s): %s", tenant_id, e)
+        return []
+
+    out: List[dict] = []
+    for p in raw:
+        text = " ".join((p.get("text") or "").split())
+        if not text:
+            continue
+        if len(text) > _POST_CONTENT_TRUNCATE:
+            text = text[:_POST_CONTENT_TRUNCATE].rstrip() + "…"
+        out.append({"text": text, "date": p.get("date")})
+    return out[:limit]
 
 
 def _peak_hours(window_posts: List[dict]) -> Optional[dict]:
@@ -202,6 +242,16 @@ def build_insights(tenant_id: str, days: int = 30, tz: Optional[str] = None) -> 
     subs = summary.get("subscribers")
     avg_views = summary.get("avg_views_per_post", 0)
 
+    # Тексты «на чтение» агенту. Приоритет — наши опубликованные посты (по ним есть
+    # метрики). Если их нет (сервис в этом канале ещё ничего не публиковал) —
+    # живой скрейп последних постов самого канала, чтобы агенту было что разбирать.
+    posts_sample = _posts_sample(window_posts)
+    posts_origin = "published" if posts_sample else ""
+    if not posts_sample:
+        live = _live_channel_posts(tenant_id)
+        if live:
+            posts_sample, posts_origin = live, "channel"
+
     # Прокси «% активных». reach_rate работает всегда, где есть подписчики и охват;
     # notifications — только если канал отдаёт Broadcast Stats. Доли отображающий
     # слой ОБЯЗАН подписывать тем, что измеряет (см. notes).
@@ -234,7 +284,8 @@ def build_insights(tenant_id: str, days: int = 30, tz: Optional[str] = None) -> 
         ),
         "summary": summary,
         "by_topic": by_topic,
-        "posts_sample": _posts_sample(window_posts),
+        "posts_sample": posts_sample,
+        "posts_sample_origin": posts_origin,
     }
 
 
@@ -299,7 +350,19 @@ def _insights_to_prompt(insights: dict) -> str:
         )
 
     sample = insights.get("posts_sample") or []
-    if sample:
+    origin = insights.get("posts_sample_origin")
+    if sample and origin == "channel":
+        # Живой скрейп: это реальные посты самого канала, но опубликованы не нами,
+        # поэтому метрик (просмотры/реакции) по ним нет — только текст.
+        lines.append(
+            f"\n=== ТЕКСТЫ ПОСЛЕДНИХ ПОСТОВ КАНАЛА (живой скрейп, {len(sample)} шт., "
+            "текст обрезан) — это реальные посты самого канала. Наш сервис их НЕ "
+            "публиковал, поэтому метрик (просмотры/реакции) по ним нет. ЧИТАЙ их и "
+            "оценивай заголовки, структуру, подачу, CTA ==="
+        )
+        for i, p in enumerate(sample, 1):
+            lines.append(f"[{i}] {p['text']}")
+    elif sample:
         lines.append(
             f"\n=== ТЕКСТЫ ПОСТОВ (выборка {len(sample)} самых просматриваемых, "
             "текст обрезан) — ЧИТАЙ их, оценивай заголовки, структуру, подачу, CTA ==="
