@@ -24,6 +24,7 @@ from database import (
     claim_schedule_slot,
     get_active_tenants,
     get_all_tenants,
+    get_schedule_plan,
     get_tenant_sources,
     purge_schedule_slots_before,
     release_schedule_slot,
@@ -75,16 +76,52 @@ def tenant_post_times(profile: TenantProfile) -> List[str]:
     return []
 
 
-async def _publish_due(bot: Bot, profile: TenantProfile, slot: str) -> None:
+def tenant_due_slots(profile: TenantProfile, now_hhmm: str, weekday: int):
+    """Слоты канала, которые должны опубликоваться прямо сейчас (now_hhmm).
+
+    Возвращает список (time, content_type), где content_type — явный тип слота
+    из недельной сетки ("topic"/"repost") или None (= использовать profile.content_mode).
+
+    weekday — день недели по TZ расписания (0=Пн … 6=Вс).
+
+    schedule_mode="weekly" → читаем недельную сетку (SchedulePlanSlot) для текущего
+    дня недели; иначе — легаси frequency/times через tenant_post_times (тип = None).
+    Тариф уважается: max_posts_per_day режет число слотов за день.
+    """
+    tier = getattr(profile, "subscription_tier", None)
+    if not allows(tier, "scheduling"):
+        return []
+
+    if (profile.schedule_mode or "off") == "weekly":
+        slots = get_schedule_plan(profile.tenant_id)
+        day_slots = [
+            s for s in slots if s.weekday == weekday and s.enabled
+        ]
+        # Лимит постов в день по тарифу (по порядку времени).
+        max_ppd = limit_of(tier, "max_posts_per_day")
+        day_slots.sort(key=lambda s: s.time)
+        if not is_unlimited(max_ppd):
+            day_slots = day_slots[:max_ppd]
+        return [(s.time, s.content_type) for s in day_slots if s.time == now_hhmm]
+
+    # Легаси-режимы: тип не задан (берётся из profile.content_mode).
+    return [(t, None) for t in tenant_post_times(profile) if t == now_hhmm]
+
+
+async def _publish_due(
+    bot: Bot, profile: TenantProfile, slot: str, content_type: str | None = None
+) -> None:
     """Сгенерировать и опубликовать один запланированный пост (фоновая задача).
 
     Вынесено из тика, чтобы тяжёлая генерация (LLM, десятки секунд) не блокировала
     минутный `schedule_tick` — иначе APScheduler пропускает следующие минуты как
     misfire, и запланированные посты «теряются». Слот уже застолблён в БД вызывающим;
     при ошибке снимаем отметку, чтобы дать ретрай на следующей минуте.
+
+    content_type — тип слота недельной сетки ("topic"/"repost"); None → по content_mode.
     """
     try:
-        content = await produce_content(profile)
+        content = await produce_content(profile, content_type=content_type)
     except Exception as e:
         await asyncio.to_thread(release_schedule_slot, slot)
         logging.error(f"Jadval generatsiya xatosi ({profile.chat_id}): {e}")
@@ -110,17 +147,20 @@ async def schedule_tick(bot: Bot) -> None:
         # Раз в сутки чистим слоты прошлых дней.
         await asyncio.to_thread(purge_schedule_slots_before, today + " ")
 
+    weekday = now.weekday()  # 0=Пн … 6=Вс
     tenants = await asyncio.to_thread(get_active_tenants)
     for profile in tenants:
         if (profile.schedule_mode or "off") == "off":
             continue
-        if now_hhmm not in tenant_post_times(profile):
-            continue
-        slot = f"{today} {now_hhmm} {profile.chat_id}"
-        claimed = await asyncio.to_thread(claim_schedule_slot, slot)
-        if not claimed:
-            continue  # слот уже застолблён — не дублируем
-        asyncio.create_task(_publish_due(bot, profile, slot))
+        due = await asyncio.to_thread(tenant_due_slots, profile, now_hhmm, weekday)
+        for _time, ctype in due:
+            # Тип в ключе слота: два разнотипных слота в одну минуту не «съедают»
+            # дедуп друг друга.
+            slot = f"{today} {now_hhmm} {profile.chat_id} {ctype or 'def'}"
+            claimed = await asyncio.to_thread(claim_schedule_slot, slot)
+            if not claimed:
+                continue  # слот уже застолблён — не дублируем
+            asyncio.create_task(_publish_due(bot, profile, slot, ctype))
 
 
 async def index_source(

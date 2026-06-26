@@ -26,7 +26,7 @@ TIER_LIMITS: Dict[str, Dict[str, Any]] = {
         "max_sources": 1,           # референс-источников на канал
         "max_posts_per_day": 1,     # потолок авто-расписания
         "scheduling": True,         # авто-постинг по расписанию
-        "repost_mode": False,       # content_mode = "repost"
+        "repost_mode": False,       # content_mode = "repost" / "both"
         "rag": False,               # use_rag / use_references
         "image_generation": False,  # картинки к постам
         "manual_publish": True,     # кнопка «опубликовать сейчас»

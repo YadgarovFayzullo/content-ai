@@ -298,17 +298,29 @@ def _make_entry(profile, text: str, image_path: str, primary: dict) -> PostHisto
     )
 
 
-async def produce_content(profile, with_image: bool = True) -> GeneratedContent:
+async def produce_content(
+    profile, with_image: bool = True, content_type: Optional[str] = None
+) -> GeneratedContent:
     """Единая точка генерации контента для канала — ветвится по content_mode.
 
     with_image — пост уйдёт с картинкой (тариф/публикация её разрешают). В topic-режиме
     влияет на длину текста (под лимит подписи к фото) и на то, генерировать ли картинку.
 
+    content_type — явный тип слота из недельной сетки ("topic"/"repost"), который
+    ПЕРЕОПРЕДЕЛЯЕТ profile.content_mode (нужен для schedule_mode="weekly", где у
+    каждого слота свой тип). None — берём поведение по profile.content_mode.
+
     repost — пересборка чужой новости (prepare_repost);
-    topic  — оригинальный пост на тему канала (generate_for_tenant).
-    Бросает RuntimeError при сбое или отсутствии новых постов в repost-режиме.
+    topic  — оригинальный пост на тему канала (generate_for_tenant);
+    both   — оба включены: сначала пробуем репост свежей новости, а если новых постов
+             в источниках нет (или источники не заданы) — генерим оригинальный пост на
+             тему канала. Так канал не простаивает, но приоритет у живых новостей.
+    Бросает RuntimeError при сбое или отсутствии новых постов в чистом repost-режиме.
     """
-    if (getattr(profile, "content_mode", "topic") or "topic") == "repost":
+    # Явный тип слота (недельная сетка) важнее content_mode канала.
+    mode = content_type or getattr(profile, "content_mode", "topic") or "topic"
+
+    if mode == "repost":
         content = await prepare_repost(profile)
         if content is None:
             raise RuntimeError(
@@ -316,4 +328,17 @@ async def produce_content(profile, with_image: bool = True) -> GeneratedContent:
                 "postlar yo'q."
             )
         return content
+
+    if mode == "both":
+        # Приоритет — репост свежей новости. Нет новостей (None) или нет источников
+        # (RuntimeError из _gather_candidates) — мягко падаем в topic-генерацию.
+        try:
+            content = await prepare_repost(profile)
+        except RuntimeError as e:
+            logging.info("Both rejimi: repost o'tkazib yuborildi (%s) — topik post", e)
+            content = None
+        if content is not None:
+            return content
+        return await asyncio.to_thread(generate_for_tenant, profile, with_image)
+
     return await asyncio.to_thread(generate_for_tenant, profile, with_image)

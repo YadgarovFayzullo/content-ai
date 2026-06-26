@@ -67,7 +67,10 @@ def render_schedule_text(profile: TenantProfile) -> str:
 def render_settings_card(profile: TenantProfile, rules_count: int) -> str:
     status = "🟢 faol" if profile.active else "⏸ pauza"
     mode = (profile.content_mode or "topic")
-    mode_label = "🔀 Repost (manbalardan)" if mode == "repost" else "✍️ Topik (original)"
+    mode_label = {
+        "repost": "🔀 Repost (manbalardan)",
+        "both": "🔀✍️ Ikkalasi (repost + topik)",
+    }.get(mode, "✍️ Topik (original)")
 
     def v(x):
         return html.escape(str(x)) if x not in (None, "") else "—"

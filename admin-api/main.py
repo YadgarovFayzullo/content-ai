@@ -7,8 +7,9 @@
 - Источников (reference channels)
 - Правил и расписания
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List, Tuple
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -54,6 +55,9 @@ from database import (
     remove_tenant_rule,
     get_tenant_sources,
     get_recent_posts,
+    get_published_posts_since,
+    get_schedule_plan,
+    replace_schedule_plan,
     get_last_post_times,
     get_tenant_stats,
     get_tenants_for_owner,
@@ -441,6 +445,58 @@ class ScheduleSchema(BaseModel):
 
 class ScheduleResponse(BaseModel):
     schedule: ScheduleSchema
+
+
+# --- Недельная сетка расписания (weekly grid) -------------------------------
+
+class WeekdaySlotSchema(BaseModel):
+    weekday: int            # 0=Пн … 6=Вс
+    time: str               # "HH:MM"
+    content_type: str       # "topic" | "repost"
+    enabled: bool = True
+
+
+class SchedulePlanResponse(BaseModel):
+    slots: List[WeekdaySlotSchema]
+
+
+class SchedulePlanUpdateRequest(BaseModel):
+    slots: List[WeekdaySlotSchema]
+
+
+# --- Календарь (проекция плана + опубликованные посты) ----------------------
+
+class CalendarPlannedSchema(BaseModel):
+    time: str
+    content_type: str       # "topic" | "repost"
+
+
+class CalendarPublishedSchema(BaseModel):
+    time: str
+    content_type: str       # "topic" | "repost"
+    post_id: Optional[int] = None
+    title: str
+
+
+class CalendarDaySchema(BaseModel):
+    date: str               # "YYYY-MM-DD"
+    planned: List[CalendarPlannedSchema] = []
+    published: List[CalendarPublishedSchema] = []
+
+
+class CalendarResponse(BaseModel):
+    days: List[CalendarDaySchema]
+
+
+class CalendarChannelSchema(BaseModel):
+    tenant_id: str
+    channel_name: str
+    chat_id: str
+    days: List[CalendarDaySchema]
+
+
+class GlobalCalendarResponse(BaseModel):
+    channels: List[CalendarChannelSchema]
 
 
 class RAGHealthSchema(BaseModel):
@@ -1046,6 +1102,234 @@ async def delete_rule(
     return {"success": True, "message": "Rule removed"}
 
 
+# ============================================================================
+# Расписание (недельная сетка) + календарь
+# ============================================================================
+
+# TZ расписания — та же, что у бота-планировщика (по умолчанию Ташкент). Нужна,
+# чтобы «сегодня» и время опубликованных постов совпадали с автопостингом.
+try:
+    _SCHED_TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tashkent"))
+except Exception:
+    _SCHED_TZ = timezone(timedelta(hours=5))
+
+_CONTENT_TYPES = {"topic", "repost"}
+_DATE_FMT = "%Y-%m-%d"
+
+
+def _parse_range(date_from: str, date_to: str) -> tuple[date, date]:
+    """Парсит from/to (YYYY-MM-DD); валидирует диапазон (≤ 92 дня — квартал)."""
+    try:
+        d0 = datetime.strptime(date_from, _DATE_FMT).date()
+        d1 = datetime.strptime(date_to, _DATE_FMT).date()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="from/to must be YYYY-MM-DD")
+    if d1 < d0:
+        raise HTTPException(status_code=422, detail="'to' must be >= 'from'")
+    if (d1 - d0).days > 92:
+        raise HTTPException(status_code=422, detail="range too large (max 92 days)")
+    return d0, d1
+
+
+def _valid_hhmm(t: str) -> bool:
+    try:
+        h, m = t.split(":")
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59 and len(m) == 2
+    except (ValueError, AttributeError):
+        return False
+
+
+@app.get("/api/admin/tenants/{tenant_id}/schedule", response_model=SchedulePlanResponse, tags=["Schedule"])
+async def get_schedule(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+) -> SchedulePlanResponse:
+    """Недельная сетка слотов канала (weekly grid)."""
+    await _require_tenant(principal, tenant_id)
+    slots = await asyncio.to_thread(get_schedule_plan, tenant_id)
+    return SchedulePlanResponse(
+        slots=[
+            WeekdaySlotSchema(
+                weekday=s.weekday, time=s.time,
+                content_type=s.content_type, enabled=s.enabled,
+            )
+            for s in slots
+        ]
+    )
+
+
+@app.put("/api/admin/tenants/{tenant_id}/schedule", response_model=SchedulePlanResponse, tags=["Schedule"])
+async def update_schedule(
+    tenant_id: str,
+    req: SchedulePlanUpdateRequest,
+    principal: Principal = Depends(get_principal),
+) -> SchedulePlanResponse:
+    """Заменить недельную сетку канала. Гейтится тарифом: scheduling, repost_mode
+    (для repost-слотов) и max_posts_per_day на каждый день недели."""
+    profile = await _require_tenant(principal, tenant_id)
+    tier = getattr(profile, "subscription_tier", None)
+
+    # Валидация формата слотов.
+    for s in req.slots:
+        if not 0 <= s.weekday <= 6:
+            raise HTTPException(status_code=422, detail="weekday must be 0..6 (Mon..Sun)")
+        if not _valid_hhmm(s.time):
+            raise HTTPException(status_code=422, detail=f"invalid time '{s.time}' (HH:MM)")
+        if s.content_type not in _CONTENT_TYPES:
+            raise HTTPException(status_code=422, detail="content_type must be 'topic' or 'repost'")
+
+    # Тариф (супер-админ не ограничен).
+    if not principal.is_super and req.slots:
+        if not allows(tier, "scheduling"):
+            _tier_feature_error("scheduling", tier)
+        if any(s.content_type == "repost" for s in req.slots) and not allows(tier, "repost_mode"):
+            _tier_feature_error("repost_mode", tier)
+        maxp = limit_of(tier, "max_posts_per_day")
+        per_day: dict[int, int] = {}
+        for s in req.slots:
+            if s.enabled:
+                per_day[s.weekday] = per_day.get(s.weekday, 0) + 1
+        worst = max(per_day.values(), default=0)
+        if not within_limit(worst, maxp):
+            _tier_quota_error("max_posts_per_day", worst, maxp, tier)
+
+    saved = await asyncio.to_thread(
+        replace_schedule_plan,
+        tenant_id,
+        [s.dict() for s in req.slots],
+    )
+    # Непустая сетка → schedule_mode="weekly"; пустая → "off" (выключить автопостинг).
+    await asyncio.to_thread(
+        update_tenant_profile, tenant_id,
+        schedule_mode="weekly" if req.slots else "off",
+    )
+    return SchedulePlanResponse(
+        slots=[
+            WeekdaySlotSchema(
+                weekday=s.weekday, time=s.time,
+                content_type=s.content_type, enabled=s.enabled,
+            )
+            for s in saved
+        ]
+    )
+
+
+def _project_calendar(
+    profile: TenantProfile, slots, posts, d0: date, d1: date, tier: str, is_super: bool
+) -> List[CalendarDaySchema]:
+    """Собирает дни календаря: план (проекция недельной сетки на будущие даты) +
+    опубликованные посты из истории. Возвращает только непустые дни."""
+    today = datetime.now(_SCHED_TZ).date()
+
+    # max_posts_per_day режет план так же, как сделает планировщик.
+    maxp = limit_of(tier, "max_posts_per_day")
+    by_weekday: dict[int, list] = {}
+    for s in slots:
+        if s.enabled:
+            by_weekday.setdefault(s.weekday, []).append(s)
+    for wd in by_weekday:
+        by_weekday[wd].sort(key=lambda s: s.time)
+        if not is_super and not is_unlimited(maxp):
+            by_weekday[wd] = by_weekday[wd][:maxp]
+
+    days: dict[str, CalendarDaySchema] = {}
+
+    # План — только сегодня и будущее (прошлый план уже либо опубликован, либо нет).
+    weekly_on = (profile.schedule_mode or "off") == "weekly"
+    if weekly_on:
+        cur = max(d0, today)
+        while cur <= d1:
+            wd_slots = by_weekday.get(cur.weekday(), [])
+            if wd_slots:
+                key = cur.strftime(_DATE_FMT)
+                days[key] = CalendarDaySchema(
+                    date=key,
+                    planned=[
+                        CalendarPlannedSchema(time=s.time, content_type=s.content_type)
+                        for s in wd_slots
+                    ],
+                )
+            cur += timedelta(days=1)
+
+    # Опубликованные — из истории в диапазоне.
+    for p in posts:
+        if not p.created_at:
+            continue
+        local = p.created_at.astimezone(_SCHED_TZ) if p.created_at.tzinfo else p.created_at.replace(tzinfo=timezone.utc).astimezone(_SCHED_TZ)
+        pd = local.date()
+        if pd < d0 or pd > d1:
+            continue
+        key = pd.strftime(_DATE_FMT)
+        day = days.get(key) or CalendarDaySchema(date=key)
+        ctype = "repost" if (p.topic or "") == "repost" else "topic"
+        title = (p.topic if (p.topic and p.topic != "repost") else (p.content or "")[:48]) or "—"
+        day.published.append(
+            CalendarPublishedSchema(
+                time=local.strftime("%H:%M"),
+                content_type=ctype,
+                post_id=p.id,
+                title=title,
+            )
+        )
+        days[key] = day
+
+    return [days[k] for k in sorted(days)]
+
+
+@app.get("/api/admin/tenants/{tenant_id}/calendar", response_model=CalendarResponse, tags=["Schedule"])
+async def get_tenant_calendar(
+    tenant_id: str,
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+    principal: Principal = Depends(get_principal),
+) -> CalendarResponse:
+    """Календарь канала: запланированные слоты (проекция) + опубликованные посты."""
+    profile = await _require_tenant(principal, tenant_id)
+    d0, d1 = _parse_range(date_from, date_to)
+    slots = await asyncio.to_thread(get_schedule_plan, tenant_id)
+    since = datetime.combine(d0, datetime.min.time(), tzinfo=_SCHED_TZ)
+    posts = await asyncio.to_thread(get_published_posts_since, tenant_id, since)
+    days = _project_calendar(
+        profile, slots, posts, d0, d1,
+        getattr(profile, "subscription_tier", None), principal.is_super,
+    )
+    return CalendarResponse(days=days)
+
+
+@app.get("/api/admin/calendar", response_model=GlobalCalendarResponse, tags=["Schedule"])
+async def get_global_calendar(
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+    principal: Principal = Depends(get_principal),
+) -> GlobalCalendarResponse:
+    """Календарь всех каналов принципала (по каждому каналу — свои дни)."""
+    d0, d1 = _parse_range(date_from, date_to)
+    if principal.is_super:
+        tenants = await asyncio.to_thread(get_all_tenants)
+    else:
+        tenants = await asyncio.to_thread(get_tenants_for_owner, principal.owner_id)
+
+    since = datetime.combine(d0, datetime.min.time(), tzinfo=_SCHED_TZ)
+    channels: List[CalendarChannelSchema] = []
+    for profile in tenants:
+        slots = await asyncio.to_thread(get_schedule_plan, profile.tenant_id)
+        posts = await asyncio.to_thread(get_published_posts_since, profile.tenant_id, since)
+        days = _project_calendar(
+            profile, slots, posts, d0, d1,
+            getattr(profile, "subscription_tier", None), principal.is_super,
+        )
+        if days:
+            channels.append(
+                CalendarChannelSchema(
+                    tenant_id=profile.tenant_id,
+                    channel_name=profile.channel_name or profile.chat_id,
+                    chat_id=profile.chat_id,
+                    days=days,
+                )
+            )
+    return GlobalCalendarResponse(channels=channels)
+
+
 def _probe_rag_ready() -> str:
     """Опрашивает RAG-сервис (отдельный контейнер) на готовность Qdrant.
 
@@ -1098,7 +1382,7 @@ def _enforce_profile_tier(principal: Principal, tier: str, data: dict) -> None:
     if data.get("use_rag") or data.get("use_references"):
         if not allows(tier, "rag"):
             _tier_feature_error("rag", tier)
-    if data.get("content_mode") == "repost" and not allows(tier, "repost_mode"):
+    if data.get("content_mode") in ("repost", "both") and not allows(tier, "repost_mode"):
         _tier_feature_error("repost_mode", tier)
     if data.get("schedule_mode") and data["schedule_mode"] != "off":
         if not allows(tier, "scheduling"):
@@ -1122,10 +1406,10 @@ async def update_profile(
     profile = await _require_tenant(principal, tenant_id)
 
     update_data = update.dict(exclude_unset=True)
-    if "content_mode" in update_data and update_data["content_mode"] not in ("topic", "repost"):
-        raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
-    if "schedule_mode" in update_data and update_data["schedule_mode"] not in ("off", "frequency", "times"):
-        raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency' or 'times'")
+    if "content_mode" in update_data and update_data["content_mode"] not in ("topic", "repost", "both"):
+        raise HTTPException(status_code=422, detail="content_mode must be 'topic', 'repost' or 'both'")
+    if "schedule_mode" in update_data and update_data["schedule_mode"] not in ("off", "frequency", "times", "weekly"):
+        raise HTTPException(status_code=422, detail="schedule_mode must be 'off', 'frequency', 'times' or 'weekly'")
     if "image_mode" in update_data and update_data["image_mode"] not in ("ai", "stock", "none"):
         raise HTTPException(status_code=422, detail="image_mode must be 'ai', 'stock' or 'none'")
     if "avg_post_length" in update_data and update_data["avg_post_length"] is not None:
@@ -1357,8 +1641,8 @@ async def create_tenant_endpoint(
         chat_id = chat_id.lower()
 
     fields = req.dict(exclude_unset=True, exclude={"chat_id", "owner_id", "subscription_tier"})
-    if "content_mode" in fields and fields["content_mode"] not in ("topic", "repost"):
-        raise HTTPException(status_code=422, detail="content_mode must be 'topic' or 'repost'")
+    if "content_mode" in fields and fields["content_mode"] not in ("topic", "repost", "both"):
+        raise HTTPException(status_code=422, detail="content_mode must be 'topic', 'repost' or 'both'")
 
     if principal.is_super:
         # Супер задаёт владельца и тариф явно (или дефолты).
@@ -1375,7 +1659,7 @@ async def create_tenant_endpoint(
         maxc = limit_of(owner_tier, "max_channels")
         if not within_limit(count + 1, maxc):
             _tier_quota_error("max_channels", count, maxc, owner_tier)
-        if fields.get("content_mode") == "repost" and not allows(owner_tier, "repost_mode"):
+        if fields.get("content_mode") in ("repost", "both") and not allows(owner_tier, "repost_mode"):
             _tier_feature_error("repost_mode", owner_tier)
         fields["owner_id"] = owner_id
         fields["subscription_tier"] = owner_tier

@@ -95,7 +95,7 @@ async def post_weekly_reviews(bot: Bot) -> int:
     tenants = await asyncio.to_thread(get_active_tenants)
     published = 0
     for profile in tenants:
-        if (getattr(profile, "content_mode", "topic") or "topic") != "repost":
+        if (getattr(profile, "content_mode", "topic") or "topic") not in ("repost", "both"):
             continue
 
         posts = await asyncio.to_thread(

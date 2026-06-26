@@ -63,7 +63,9 @@ class TenantProfile(SQLModel, table=True):
     #   topic  — генерация оригинальных постов на темы из `topics` (с ротацией);
     #   repost — пересборка чужих новостей: посты из source-каналов отбираются,
     #            переводятся/адаптируются под стиль канала и публикуются.
-    # В repost-режиме source-каналы (TenantSource) — это новостная лента, а не
+    #   both   — оба: на каждый пост сначала пробуем репост свежей новости, а если
+    #            новых постов в источниках нет — генерим оригинальный topic-пост.
+    # В repost/both-режиме source-каналы (TenantSource) — это новостная лента, а не
     # просто RAG-контекст.
     content_mode: str = "topic"
 
@@ -288,6 +290,25 @@ class ScheduleSlot(SQLModel, table=True):
 
     slot: str = Field(primary_key=True)  # "YYYY-MM-DD HH:MM <chat_id>"
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class SchedulePlanSlot(SQLModel, table=True):
+    """Недельная сетка автопостинга (один слот = пост в конкретный день недели).
+
+    В отличие от ScheduleSlot (дедуп УЖЕ запущенных постов), это РАСПИСАНИЕ:
+    для каждого дня недели — список слотов «время + тип контента», повторяется
+    каждую неделю. Используется при schedule_mode="weekly". Тип слота задаёт, что
+    публиковать в этот слот (topic/repost), независимо от profile.content_mode.
+    """
+
+    __tablename__ = "schedule_plan_slots"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(index=True)
+    weekday: int            # 0=Пн … 6=Вс (datetime.weekday())
+    time: str               # "HH:MM" в TZ расписания
+    content_type: str       # "topic" | "repost"
+    enabled: bool = True
 
 
 class TopicAlias(SQLModel, table=True):
@@ -1139,6 +1160,42 @@ def remove_tenant_source(source_id: int) -> bool:
         session.delete(src)
         session.commit()
         return True
+
+
+def get_schedule_plan(tenant_id: str) -> List["SchedulePlanSlot"]:
+    """Недельная сетка слотов канала, отсортированная по (день недели, время)."""
+    with Session(engine, expire_on_commit=False) as session:
+        return list(
+            session.exec(
+                select(SchedulePlanSlot)
+                .where(SchedulePlanSlot.tenant_id == tenant_id)
+                .order_by(SchedulePlanSlot.weekday, SchedulePlanSlot.time)
+            ).all()
+        )
+
+
+def replace_schedule_plan(tenant_id: str, slots: List[dict]) -> List["SchedulePlanSlot"]:
+    """Полностью заменяет недельную сетку канала (удалить старое + вставить новое
+    в одной транзакции). slots = [{"weekday","time","content_type","enabled"}].
+    Возвращает сохранённые слоты."""
+    with Session(engine, expire_on_commit=False) as session:
+        for old in session.exec(
+            select(SchedulePlanSlot).where(SchedulePlanSlot.tenant_id == tenant_id)
+        ).all():
+            session.delete(old)
+        created: List[SchedulePlanSlot] = []
+        for s in slots:
+            row = SchedulePlanSlot(
+                tenant_id=tenant_id,
+                weekday=int(s["weekday"]),
+                time=str(s["time"]),
+                content_type=str(s["content_type"]),
+                enabled=bool(s.get("enabled", True)),
+            )
+            session.add(row)
+            created.append(row)
+        session.commit()
+        return created
 
 
 def get_top_posts(tenant_id: str, limit: int = 3) -> List[str]:

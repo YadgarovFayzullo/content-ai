@@ -112,11 +112,17 @@ async def on_toggle_mode(callback, button, dialog_manager: DialogManager):
     profile = await asyncio.to_thread(get_tenant_profile, tid)
     if not profile:
         return await callback.answer("Sessiya tugadi")
-    new_mode = "repost" if (profile.content_mode or "topic") != "repost" else "topic"
+    # Циклический переключатель: topik → repost → ikkalasi (both) → topik.
+    cycle = ["topic", "repost", "both"]
+    cur = profile.content_mode or "topic"
+    new_mode = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "repost"
     await asyncio.to_thread(update_tenant_profile, tid, content_mode=new_mode)
-    await callback.answer(
-        "Repost rejimi (manbalardan)" if new_mode == "repost" else "Topik rejimi (original)"
-    )
+    labels = {
+        "topic": "Topik rejimi (original)",
+        "repost": "Repost rejimi (manbalardan)",
+        "both": "Ikkalasi: repost + topik",
+    }
+    await callback.answer(labels[new_mode])
 
 
 async def on_toggle_rag(callback, button, dialog_manager: DialogManager):
@@ -476,7 +482,7 @@ settings_dialog = Dialog(
     Window(
         Format("{card}"),
         Button(Const("🔁 Faol/Pauza"), id="toggle", on_click=on_toggle_active),
-        Button(Const("🔀 Rejim (topik/repost)"), id="mode", on_click=on_toggle_mode),
+        Button(Const("🔀 Rejim (topik/repost/ikkalasi)"), id="mode", on_click=on_toggle_mode),
         Button(Const("🧠 RAG yoq/o'chir"), id="rag", on_click=on_toggle_rag),
         Button(Const("📡 Manbalar yoq/o'chir"), id="ref", on_click=on_toggle_ref),
         SwitchTo(Const("✏️ Maydonlarni tahrirlash"), id="fields", state=SettingsSG.fields),
