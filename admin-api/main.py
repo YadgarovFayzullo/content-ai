@@ -1116,6 +1116,38 @@ except Exception:
 _CONTENT_TYPES = {"topic", "repost"}
 _DATE_FMT = "%Y-%m-%d"
 
+# Окно равномерного распределения для legacy-режима frequency (должно совпадать
+# с bot/scheduler.py POST_WINDOW_START/END), чтобы календарь показывал те же
+# времена, что реально выберет планировщик.
+_POST_WINDOW_START = 9 * 60
+_POST_WINDOW_END = 21 * 60
+
+
+def _legacy_post_times(profile: TenantProfile, tier: str) -> List[str]:
+    """Времена "HH:MM" для legacy-режимов frequency/times — зеркало
+    bot/scheduler.py::tenant_post_times. Нужно, чтобы каналы со старым
+    расписанием тоже отображались в календаре (а не только weekly-сетка)."""
+    if not allows(tier, "scheduling"):
+        return []
+    mode = profile.schedule_mode or "off"
+    max_ppd = limit_of(tier, "max_posts_per_day")
+
+    if mode == "frequency" and (profile.posts_per_day or 0) > 0:
+        ppd = profile.posts_per_day if is_unlimited(max_ppd) else min(profile.posts_per_day, max_ppd)
+        n = min(ppd, 24)
+        if n == 1:
+            mins = [(_POST_WINDOW_START + _POST_WINDOW_END) // 2]
+        else:
+            step = (_POST_WINDOW_END - _POST_WINDOW_START) / (n - 1)
+            mins = [round(_POST_WINDOW_START + step * i) for i in range(n)]
+        return [f"{m // 60:02d}:{m % 60:02d}" for m in mins]
+
+    if mode == "times" and profile.post_times:
+        times = [t.strip() for t in profile.post_times.split(",") if t.strip()]
+        return times if is_unlimited(max_ppd) else times[:max_ppd]
+
+    return []
+
 
 def _parse_range(date_from: str, date_to: str) -> tuple[date, date]:
     """Парсит from/to (YYYY-MM-DD); валидирует диапазон (≤ 92 дня — квартал)."""
@@ -1235,8 +1267,8 @@ def _project_calendar(
     days: dict[str, CalendarDaySchema] = {}
 
     # План — только сегодня и будущее (прошлый план уже либо опубликован, либо нет).
-    weekly_on = (profile.schedule_mode or "off") == "weekly"
-    if weekly_on:
+    mode = profile.schedule_mode or "off"
+    if mode == "weekly":
         cur = max(d0, today)
         while cur <= d1:
             wd_slots = by_weekday.get(cur.weekday(), [])
@@ -1250,6 +1282,23 @@ def _project_calendar(
                     ],
                 )
             cur += timedelta(days=1)
+    elif mode in ("frequency", "times"):
+        # Legacy: одно и то же расписание каждый день, тип — из content_mode.
+        ltimes = _legacy_post_times(profile, tier)
+        if ltimes:
+            ctype = "repost" if (profile.content_mode or "topic") == "repost" else (
+                "both" if profile.content_mode == "both" else "topic"
+            )
+            cur = max(d0, today)
+            while cur <= d1:
+                key = cur.strftime(_DATE_FMT)
+                days[key] = CalendarDaySchema(
+                    date=key,
+                    planned=[
+                        CalendarPlannedSchema(time=t, content_type=ctype) for t in ltimes
+                    ],
+                )
+                cur += timedelta(days=1)
 
     # Опубликованные — из истории в диапазоне.
     for p in posts:
