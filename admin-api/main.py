@@ -72,6 +72,13 @@ from database import (
     create_auth_session,
     get_session_owner,
     delete_auth_session,
+    create_chat_session,
+    list_chat_sessions,
+    get_chat_session,
+    get_chat_messages,
+    add_chat_message,
+    rename_chat_session,
+    delete_chat_session,
 )
 from tiers import (
     TIER_LIMITS,
@@ -738,6 +745,36 @@ class AiChatRequest(BaseModel):
     # IANA-таймзона пользователя из браузера (напр. "Asia/Tashkent") — в ней
     # показываем пик активности вместо UTC. None → UTC.
     tz: Optional[str] = None
+    # Сессия беседы (uuid). Если задана — реплики (вопрос + ответ агента)
+    # сохраняются в БД под этой беседой. None → разовый ответ без сохранения.
+    session_id: Optional[str] = None
+
+
+def _chat_owner_key(principal: Principal) -> str:
+    """Ключ владельца для скоупинга бесед: owner_id клиента или '' для супер-токена."""
+    return principal.owner_id or ""
+
+
+def _chat_session_schema(chat) -> dict:
+    return {
+        "session_id": chat.session_id,
+        "tenant_id": chat.tenant_id,
+        "title": chat.title or "",
+        "created_at": chat.created_at.isoformat() if chat.created_at else None,
+        "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
+    }
+
+
+async def _require_chat_session(principal: Principal, tenant_id: str, session_id: str):
+    """Беседа с проверкой принадлежности каналу и владельцу. 404 если нет/чужая."""
+    chat = await asyncio.to_thread(get_chat_session, session_id)
+    if (
+        not chat
+        or chat.tenant_id != tenant_id
+        or (not principal.is_super and chat.owner_id != _chat_owner_key(principal))
+    ):
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    return chat
 
 
 @app.post("/api/admin/tenants/{tenant_id}/ai-chat", tags=["Metrics"])
@@ -763,8 +800,21 @@ async def ai_chat_endpoint(
     ):
         days = min(days, BASIC_ANALYTICS_MAX_DAYS)
 
+    # Если задана сессия — она должна существовать и принадлежать клиенту.
+    chat = None
+    if req.session_id:
+        chat = await _require_chat_session(principal, tenant_id, req.session_id)
+
     # history передаём как есть, но ограничиваем длину — защита от раздувания промпта.
-    history = (req.history or [])[-10:]
+    # Если сессия известна, а history не передан — берём её из БД (источник правды).
+    if req.history is not None:
+        history = req.history[-10:]
+    elif chat is not None:
+        stored = await asyncio.to_thread(get_chat_messages, chat.session_id)
+        history = [{"role": m.role, "content": m.content} for m in stored][-10:]
+    else:
+        history = []
+
     try:
         result = await asyncio.to_thread(
             analytics_chat, tenant_id, message, history, days, req.tz
@@ -772,7 +822,85 @@ async def ai_chat_endpoint(
     except Exception as e:
         logging.error("AI chat error (tenant %s): %s", tenant_id, e)
         raise HTTPException(status_code=502, detail=f"AI agent error: {e}")
+
+    # Персистим обе реплики в беседу (вопрос пользователя + ответ агента).
+    if chat is not None:
+        reply = result.get("reply") if isinstance(result, dict) else None
+        await asyncio.to_thread(add_chat_message, chat.session_id, "user", message)
+        if reply:
+            await asyncio.to_thread(add_chat_message, chat.session_id, "assistant", reply)
+        result = {**result, "session_id": chat.session_id}
     return result
+
+
+@app.get("/api/admin/tenants/{tenant_id}/chat-sessions", tags=["Metrics"])
+async def list_chat_sessions_endpoint(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Список сохранённых бесед с ИИ-агентом канала (новые→старые), для сайдбара."""
+    await _require_tenant(principal, tenant_id)
+    sessions = await asyncio.to_thread(
+        list_chat_sessions, tenant_id, _chat_owner_key(principal)
+    )
+    return {"sessions": [_chat_session_schema(s) for s in sessions]}
+
+
+@app.post("/api/admin/tenants/{tenant_id}/chat-sessions", tags=["Metrics"])
+async def create_chat_session_endpoint(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Создаёт новую (пустую) беседу и возвращает её."""
+    await _require_tenant(principal, tenant_id)
+    chat = await asyncio.to_thread(
+        create_chat_session, tenant_id, _chat_owner_key(principal)
+    )
+    return _chat_session_schema(chat)
+
+
+@app.get("/api/admin/tenants/{tenant_id}/chat-sessions/{session_id}", tags=["Metrics"])
+async def get_chat_session_endpoint(
+    tenant_id: str,
+    session_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Беседа с её сообщениями (для открытия в чате)."""
+    chat = await _require_chat_session(principal, tenant_id, session_id)
+    messages = await asyncio.to_thread(get_chat_messages, session_id)
+    return {
+        **_chat_session_schema(chat),
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+    }
+
+
+class ChatSessionRenameRequest(BaseModel):
+    title: str
+
+
+@app.patch("/api/admin/tenants/{tenant_id}/chat-sessions/{session_id}", tags=["Metrics"])
+async def rename_chat_session_endpoint(
+    tenant_id: str,
+    session_id: str,
+    req: ChatSessionRenameRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Переименовать беседу."""
+    await _require_chat_session(principal, tenant_id, session_id)
+    chat = await asyncio.to_thread(rename_chat_session, session_id, req.title)
+    return _chat_session_schema(chat)
+
+
+@app.delete("/api/admin/tenants/{tenant_id}/chat-sessions/{session_id}", tags=["Metrics"])
+async def delete_chat_session_endpoint(
+    tenant_id: str,
+    session_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Удалить беседу вместе с сообщениями."""
+    await _require_chat_session(principal, tenant_id, session_id)
+    ok = await asyncio.to_thread(delete_chat_session, session_id)
+    return {"ok": ok}
 
 
 @app.get("/api/admin/tenants/{tenant_id}/posts", response_model=PostsListResponse, tags=["Posts"])

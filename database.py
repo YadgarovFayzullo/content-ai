@@ -310,6 +310,39 @@ class TopicAlias(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class ChatSession(SQLModel, table=True):
+    """Сохранённая сессия диалога с ИИ-агентом канала (как «беседа» в ChatGPT).
+
+    Привязана к каналу (tenant_id) и владельцу панели (owner_id) — клиент видит
+    только свои беседы по своим каналам. Сообщения хранятся в ChatMessage.
+    `session_id` — стабильный публичный идентификатор (uuid), его и гоняет фронт.
+    """
+
+    __tablename__ = "chat_sessions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(default_factory=lambda: uuid.uuid4().hex, unique=True, index=True)
+    tenant_id: str = Field(index=True)
+    # Владелец беседы (Telegram user_id владельца панели). "" — супер-админ
+    # (статический токен без owner_id). Листинг скоупится по (tenant_id, owner_id).
+    owner_id: str = Field(default="", index=True)
+    title: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class ChatMessage(SQLModel, table=True):
+    """Одна реплика в сессии ИИ-агента (user | assistant). Порядок — по created_at/id."""
+
+    __tablename__ = "chat_messages"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(index=True)  # ChatSession.session_id
+    role: str = "user"                   # "user" | "assistant"
+    content: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 # ---------------------------------------------------------------------------
 # ДВИЖОК БД
 # ---------------------------------------------------------------------------
@@ -1433,3 +1466,110 @@ def get_window_post_metrics(tenant_id: str, days: int = 30) -> List[dict]:
                 }
             )
         return out
+
+
+# ---------------------------------------------------------------------------
+# СЕССИИ ИИ-ЧАТА (сохранённые беседы с агентом, как в ChatGPT)
+# ---------------------------------------------------------------------------
+
+
+def _title_from_message(text: str, limit: int = 60) -> str:
+    """Заголовок беседы из первой реплики пользователя (одна строка, обрезанная)."""
+    t = " ".join((text or "").split())
+    return (t[: limit - 1] + "…") if len(t) > limit else t
+
+
+def create_chat_session(
+    tenant_id: str, owner_id: str = "", title: str = ""
+) -> ChatSession:
+    """Создаёт новую (пустую) беседу с ИИ-агентом канала."""
+    with Session(engine, expire_on_commit=False) as session:
+        chat = ChatSession(tenant_id=tenant_id, owner_id=owner_id or "", title=title or "")
+        session.add(chat)
+        session.commit()
+        session.refresh(chat)
+        return chat
+
+
+def list_chat_sessions(tenant_id: str, owner_id: str = "") -> List[ChatSession]:
+    """Беседы канала, принадлежащие владельцу, новые→старые (по updated_at)."""
+    with Session(engine, expire_on_commit=False) as session:
+        return list(
+            session.exec(
+                select(ChatSession)
+                .where(ChatSession.tenant_id == tenant_id)
+                .where(ChatSession.owner_id == (owner_id or ""))
+                .order_by(ChatSession.updated_at.desc())
+            ).all()
+        )
+
+
+def get_chat_session(session_id: str) -> Optional[ChatSession]:
+    with Session(engine, expire_on_commit=False) as session:
+        return session.exec(
+            select(ChatSession).where(ChatSession.session_id == session_id)
+        ).first()
+
+
+def get_chat_messages(session_id: str) -> List[ChatMessage]:
+    """Сообщения беседы по порядку (старые→новые)."""
+    with Session(engine, expire_on_commit=False) as session:
+        return list(
+            session.exec(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            ).all()
+        )
+
+
+def add_chat_message(session_id: str, role: str, content: str) -> Optional[ChatMessage]:
+    """Добавляет реплику в беседу и поднимает её updated_at. Если у беседы ещё нет
+    заголовка, выводит его из первой пользовательской реплики. None — беседы нет."""
+    with Session(engine, expire_on_commit=False) as session:
+        chat = session.exec(
+            select(ChatSession).where(ChatSession.session_id == session_id)
+        ).first()
+        if not chat:
+            return None
+        msg = ChatMessage(session_id=session_id, role=role, content=content)
+        session.add(msg)
+        if role == "user" and not (chat.title or "").strip():
+            chat.title = _title_from_message(content)
+        chat.updated_at = _utcnow()
+        session.add(chat)
+        session.commit()
+        session.refresh(msg)
+        return msg
+
+
+def rename_chat_session(session_id: str, title: str) -> Optional[ChatSession]:
+    with Session(engine, expire_on_commit=False) as session:
+        chat = session.exec(
+            select(ChatSession).where(ChatSession.session_id == session_id)
+        ).first()
+        if not chat:
+            return None
+        chat.title = (title or "").strip()[:120]
+        chat.updated_at = _utcnow()
+        session.add(chat)
+        session.commit()
+        session.refresh(chat)
+        return chat
+
+
+def delete_chat_session(session_id: str) -> bool:
+    """Удаляет беседу вместе со всеми её сообщениями."""
+    with Session(engine, expire_on_commit=False) as session:
+        chat = session.exec(
+            select(ChatSession).where(ChatSession.session_id == session_id)
+        ).first()
+        if not chat:
+            return False
+        for m in session.exec(
+            select(ChatMessage).where(ChatMessage.session_id == session_id)
+        ).all():
+            session.delete(m)
+        session.delete(chat)
+        session.commit()
+        return True
