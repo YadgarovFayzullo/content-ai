@@ -20,8 +20,10 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -33,6 +35,7 @@ from database import (
     get_tenant_stats,
     get_window_post_metrics,
 )
+from tiers import allows, is_unlimited, limit_of
 
 # Минимум постов в окне, ниже которого почасовая разбивка и прогноз статистически
 # бессмысленны (1–2 поста дают «100% активности в один час» — это шум, не сигнал).
@@ -375,6 +378,167 @@ def _insights_to_prompt(insights: dict) -> str:
     return "\n".join(lines)
 
 
+# ─── Agentic-слой: предложение настроить расписание ────────────────────────────
+#
+# «Как в Notion»: ИИ не только советует, но и может ВЫПОЛНИТЬ действие. Когда совет
+# содержит конкретную рекомендацию по расписанию, модель добавляет в конец ответа
+# служебный блок-намерение (его вырезаем из текста). По намерению backend ДЕТЕРМИНИ-
+# РОВАННО собирает готовый недельный план (времена — из реального пика активности,
+# тип слотов — из режима канала и лимитов тарифа). Сам план применяет отдельный
+# confirm-эндпоинт, когда владелец нажимает «Да, настрой». LLM лишь решает КОГДА
+# предложить и в каком объёме (postов/день, типы) — но НЕ выдумывает времена.
+
+# Окно «дневных» слотов (локальный час) — как в легаси frequency-режиме (09:00–21:00).
+_DAY_BAND = (9, 21)
+# Маркеры служебного блока-намерения. Внутри — компактный JSON, который модель
+# формирует, когда рекомендует расписание. Текст между маркерами не показываем.
+_ACTION_RE = re.compile(
+    r"\[\[SCHEDULE_ACTION\]\](.*?)\[\[/SCHEDULE_ACTION\]\]", re.DOTALL
+)
+
+
+def _extract_action(reply: str) -> tuple[Optional[dict], str]:
+    """Вынимает служебный блок-намерение из ответа LLM и возвращает (hint, clean_reply).
+
+    hint — распарсенный JSON намерения ({"posts_per_day", "content_split"}) либо None,
+    если блока нет. clean_reply — текст ответа без служебного блока (его видит юзер)."""
+    m = _ACTION_RE.search(reply or "")
+    if not m:
+        return None, (reply or "").strip()
+    clean = _ACTION_RE.sub("", reply).strip()
+    try:
+        hint = json.loads(m.group(1).strip())
+    except Exception:
+        hint = {}  # блок есть, но JSON битый — всё равно предлагаем (по дефолтам)
+    return (hint if isinstance(hint, dict) else {}), clean
+
+
+def _to_local_hour(utc_hour: int, tz_name: str) -> int:
+    """UTC-час → час в таймзоне расписания (целое 0..23)."""
+    base = datetime.now(timezone.utc).replace(
+        hour=utc_hour % 24, minute=0, second=0, microsecond=0
+    )
+    try:
+        return base.astimezone(ZoneInfo(tz_name)).hour
+    except Exception:
+        return utc_hour % 24
+
+
+def _peak_local_hour(insights: dict, tz_name: str) -> Optional[int]:
+    """Локальный час пика активности (центр 3-часового окна) — якорь расписания.
+
+    None, если пик не посчитан (постов в окне слишком мало)."""
+    ah = insights.get("active_hours")
+    if not ah:
+        return None
+    # Центр окна = старт + 1 (окно ровно 3 часа); считаем в TZ расписания, а не в
+    # браузерной — слоты ИМЕННО в этой TZ и сработают (см. bot/scheduler.py).
+    return _to_local_hour(ah["start_hour_utc"] + 1, tz_name)
+
+
+def _proposed_times(n: int, peak_hour: Optional[int]) -> List[str]:
+    """N времён постинга ("HH:MM") за день: равномерно по дневному окну, но со
+    сдвигом так, чтобы один из слотов попал на пик активности канала."""
+    lo, hi = _DAY_BAND
+    if n <= 1:
+        h = peak_hour if peak_hour is not None else 12
+        return [f"{h:02d}:00"]
+
+    step = (hi - lo) / (n - 1)
+    hours = [round(lo + step * i) for i in range(n)]
+    if peak_hour is not None:
+        nearest = min(range(n), key=lambda i: abs(hours[i] - peak_hour))
+        shift = peak_hour - hours[nearest]
+        hours = [min(max(h + shift, 0), 23) for h in hours]
+
+    # Дедуп с раздвижкой (после сдвига два слота могут совпасть на краю).
+    seen: set[int] = set()
+    out: List[str] = []
+    for h in sorted(hours):
+        while h in seen and h < 23:
+            h += 1
+        seen.add(h)
+        out.append(f"{h:02d}:00")
+    return out
+
+
+def _content_split(
+    n: int, hint_split, content_mode: str, repost_allowed: bool
+) -> List[str]:
+    """Тип контента для каждого из N слотов дня по порядку.
+
+    Приоритет — явный hint от LLM (напр. ["repost","topic"]); иначе из режима канала
+    (both → чередуем repost/topic; repost/topic → один тип). Если тариф не разрешает
+    repost — всё в topic (гейт продублируется при применении)."""
+    types: List[str] = []
+    if isinstance(hint_split, list):
+        types = [t for t in hint_split if t in ("topic", "repost")]
+    if not types:
+        if content_mode == "both":
+            types = ["repost", "topic"]
+        elif content_mode == "repost":
+            types = ["repost"]
+        else:
+            types = ["topic"]
+    types = [types[i % len(types)] for i in range(n)]
+    if not repost_allowed:
+        types = ["topic"] * n
+    return types
+
+
+def build_schedule_proposal(
+    profile, insights: dict, hint: Optional[dict], tz_name: Optional[str] = None
+) -> Optional[dict]:
+    """Детерминированно собирает предложение расписания из реальных данных канала.
+
+    hint — намерение LLM ({"posts_per_day", "content_split"}); времена и финальный
+    план считаем ЗДЕСЬ (не доверяя их модели): времена — из пика активности, объём
+    зажат лимитом тарифа, тип слотов — из режима канала/тарифа. Возвращает payload
+    для фронта ИЛИ None, если канал не на тарифе с расписанием.
+
+    Структура: {type, posts_per_day, daily:[{time,content_type}], slots:[7×daily],
+    timezone, peak_hour_local}. slots — готовая недельная сетка для apply-эндпоинта."""
+    hint = hint or {}
+    tier = getattr(profile, "subscription_tier", "starter")
+    if not allows(tier, "scheduling"):
+        return None
+
+    n = hint.get("posts_per_day")
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 2
+    n = max(1, n)
+    maxp = limit_of(tier, "max_posts_per_day")
+    if not is_unlimited(maxp):
+        n = min(n, maxp)
+
+    tz_name = tz_name or os.getenv("TZ_NAME", "Asia/Tashkent")
+    times = _proposed_times(n, _peak_local_hour(insights, tz_name))
+    n = len(times)  # дедуп мог изменить количество
+
+    types = _content_split(
+        n,
+        hint.get("content_split"),
+        getattr(profile, "content_mode", "topic") or "topic",
+        allows(tier, "repost_mode"),
+    )
+    daily = [{"time": t, "content_type": ct} for t, ct in zip(times, types)]
+    slots = [
+        {"weekday": wd, "time": d["time"], "content_type": d["content_type"], "enabled": True}
+        for wd in range(7)
+        for d in daily
+    ]
+    return {
+        "type": "set_schedule",
+        "posts_per_day": n,
+        "daily": daily,
+        "slots": slots,
+        "timezone": tz_name,
+        "peak_hour_local": _peak_local_hour(insights, tz_name),
+    }
+
+
 _SYSTEM_PROMPT = (
     "Ты — ИИ-агент-менеджер Telegram-канала внутри дашборда владельца. Твоя задача "
     "— отвечать на КОНКРЕТНЫЙ вопрос владельца, опираясь ИСКЛЮЧИТЕЛЬНО на блок РЕАЛЬНЫХ "
@@ -399,7 +563,20 @@ _SYSTEM_PROMPT = (
     "нечего.\n\n"
     "Про «% активных»: Telegram не сообщает, кто открывал канал. Не называй прокси "
     "(reach rate / уведомления) точным числом активных — поясняй, что это оценка. "
-    "Отвечай кратко, по делу, на языке канала."
+    "Отвечай кратко, по делу, на языке канала.\n\n"
+    "НАСТРОЙКА РАСПИСАНИЯ ЗА ВЛАДЕЛЬЦА: если твой совет включает КОНКРЕТНУЮ "
+    "рекомендацию по автопостингу (сколько постов в день и какого типа), и это "
+    "уместно — заверши ответ короткой фразой-предложением «Хотите, я настрою это "
+    "расписание за вас?» (на языке канала), а затем добавь в САМОМ КОНЦЕ служебный "
+    "блок ровно в таком формате (пользователь его НЕ увидит, времена не указывай — "
+    "их подберёт система по пику активности):\n"
+    "[[SCHEDULE_ACTION]]{\"posts_per_day\": <число>, \"content_split\": [<типы>]}[[/SCHEDULE_ACTION]]\n"
+    "где content_split — массив длиной posts_per_day с типом каждого поста дня по "
+    "порядку: \"repost\" (пересборка чужой новости) или \"topic\" (оригинальный пост). "
+    "Пример для «2 поста в день, первый репост, второй тема»: "
+    "[[SCHEDULE_ACTION]]{\"posts_per_day\": 2, \"content_split\": [\"repost\", \"topic\"]}[[/SCHEDULE_ACTION]]. "
+    "Добавляй этот блок ТОЛЬКО когда реально рекомендуешь расписание; если про "
+    "расписание речи нет — блок не добавляй."
 )
 
 
@@ -412,10 +589,12 @@ def chat(
 ) -> dict:
     """ИИ-менеджер отвечает на вопрос о канале поверх реальных метрик.
 
-    Возвращает {"reply": str, "insights": dict}: текст для чата + сами числа
-    (фронт может показать карточки/графики рядом с ответом). history — прошлые
-    реплики чата [{role, content}] для контекста диалога. tz — IANA-таймзона
-    пользователя (из браузера), в ней показывается пик активности."""
+    Возвращает {"reply": str, "insights": dict, "proposed_action": dict|None}: текст
+    для чата + сами числа (фронт может показать карточки/графики рядом с ответом) +
+    необязательное ПРЕДЛОЖЕНИЕ ДЕЙСТВИЯ — готовый план расписания, который владелец
+    может применить одной кнопкой («хотите, настрою?» → confirm-эндпоинт). history —
+    прошлые реплики чата [{role, content}] для контекста. tz — IANA-таймзона юзера
+    (из браузера), в ней показывается пик активности."""
     from generator import groq_chat
 
     insights = build_insights(tenant_id, days, tz)
@@ -430,5 +609,16 @@ def chat(
         f"=== КОНЕЦ ДАННЫХ ===\n\n"
         f"Вопрос владельца: {message.strip()}"
     )
-    reply = groq_chat(_SYSTEM_PROMPT, user, temperature=0.4, history=history)
-    return {"reply": reply.strip(), "insights": insights}
+    raw = groq_chat(_SYSTEM_PROMPT, user, temperature=0.4, history=history)
+
+    # Вырезаем служебный блок-намерение и, если он был, собираем готовое предложение
+    # расписания из реальных данных (времена — из пика, объём — в рамках тарифа).
+    action_hint, reply = _extract_action(raw)
+    proposed_action = None
+    if action_hint is not None:
+        try:
+            proposed_action = build_schedule_proposal(profile, insights, action_hint)
+        except Exception as e:
+            logging.warning("Не удалось собрать предложение расписания (%s): %s", tenant_id, e)
+
+    return {"reply": reply, "insights": insights, "proposed_action": proposed_action}

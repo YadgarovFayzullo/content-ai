@@ -895,6 +895,65 @@ async def ai_chat_endpoint(
     return result
 
 
+class AiChatApplyActionRequest(BaseModel):
+    # Готовая недельная сетка из proposed_action.slots (ответ ai-chat). Применяется
+    # как есть, но повторно валидируется по формату и тарифу — клиенту нельзя
+    # обойти лимиты, даже если подделает payload.
+    slots: List[WeekdaySlotSchema]
+    # Беседа, в которую залогировать подтверждение («Готово, настроил…»). Опционально.
+    session_id: Optional[str] = None
+
+
+def _apply_confirmation_text(saved: List["SchedulePlanSlot"]) -> str:
+    """Короткое подтверждение для чата по применённой сетке (паттерн одного дня —
+    сетка одинакова по дням, см. build_schedule_proposal)."""
+    day0 = sorted([s for s in saved if s.weekday == 0], key=lambda s: s.time)
+    label = {"repost": "репост", "topic": "тема"}
+    parts = ", ".join(f"{s.time} — {label.get(s.content_type, s.content_type)}" for s in day0)
+    return (
+        f"Готово ✅ Настроил автопостинг: каждый день {len(day0)} "
+        f"пост(ов) — {parts}. Изменить можно на вкладке «Расписание»."
+    )
+
+
+@app.post("/api/admin/tenants/{tenant_id}/ai-chat/apply-action", tags=["Metrics"])
+async def ai_chat_apply_action(
+    tenant_id: str,
+    req: AiChatApplyActionRequest,
+    principal: Principal = Depends(get_principal),
+):
+    """Применяет предложение ИИ настроить расписание (ответ владельца «да, настрой»).
+
+    Тот же гейтинг по тарифу, что и ручной PUT /schedule. Если передан session_id —
+    логирует подтверждение в беседу, чтобы оно осталось в истории чата."""
+    profile = await _require_tenant(principal, tenant_id)
+    if not req.slots:
+        raise HTTPException(status_code=422, detail="slots required")
+
+    saved = await _apply_schedule_slots(profile, principal, req.slots)
+
+    confirmation = _apply_confirmation_text(saved)
+    if req.session_id:
+        chat = await _require_chat_session(principal, tenant_id, req.session_id)
+        await asyncio.to_thread(
+            add_chat_message, chat.session_id, "assistant", confirmation
+        )
+
+    return {
+        "applied": True,
+        "confirmation": confirmation,
+        "schedule": SchedulePlanResponse(
+            slots=[
+                WeekdaySlotSchema(
+                    weekday=s.weekday, time=s.time,
+                    content_type=s.content_type, enabled=s.enabled,
+                )
+                for s in saved
+            ]
+        ),
+    }
+
+
 @app.get("/api/admin/tenants/{tenant_id}/chat-sessions", tags=["Metrics"])
 async def list_chat_sessions_endpoint(
     tenant_id: str,
@@ -1215,6 +1274,53 @@ async def get_schedule(
     )
 
 
+async def _apply_schedule_slots(
+    profile: TenantProfile,
+    principal: Principal,
+    slots: List[WeekdaySlotSchema],
+) -> List["SchedulePlanSlot"]:
+    """Валидирует (формат + тариф) и сохраняет недельную сетку канала.
+
+    Общая логика для ручного PUT /schedule и для применения AI-предложения
+    (apply-action) — единый источник правды по гейтингу: scheduling, repost_mode
+    (для repost-слотов) и max_posts_per_day на каждый день недели. Непустая сетка
+    переводит профиль в schedule_mode="weekly", пустая — в "off"."""
+    tier = getattr(profile, "subscription_tier", None)
+
+    # Валидация формата слотов.
+    for s in slots:
+        if not 0 <= s.weekday <= 6:
+            raise HTTPException(status_code=422, detail="weekday must be 0..6 (Mon..Sun)")
+        if not _valid_hhmm(s.time):
+            raise HTTPException(status_code=422, detail=f"invalid time '{s.time}' (HH:MM)")
+        if s.content_type not in _CONTENT_TYPES:
+            raise HTTPException(status_code=422, detail="content_type must be 'topic' or 'repost'")
+
+    # Тариф (супер-админ не ограничен).
+    if not principal.is_super and slots:
+        if not allows(tier, "scheduling"):
+            _tier_feature_error("scheduling", tier)
+        if any(s.content_type == "repost" for s in slots) and not allows(tier, "repost_mode"):
+            _tier_feature_error("repost_mode", tier)
+        maxp = limit_of(tier, "max_posts_per_day")
+        per_day: dict[int, int] = {}
+        for s in slots:
+            if s.enabled:
+                per_day[s.weekday] = per_day.get(s.weekday, 0) + 1
+        worst = max(per_day.values(), default=0)
+        if not within_limit(worst, maxp):
+            _tier_quota_error("max_posts_per_day", worst, maxp, tier)
+
+    saved = await asyncio.to_thread(
+        replace_schedule_plan, profile.tenant_id, [s.dict() for s in slots]
+    )
+    await asyncio.to_thread(
+        update_tenant_profile, profile.tenant_id,
+        schedule_mode="weekly" if slots else "off",
+    )
+    return saved
+
+
 @app.put("/api/admin/tenants/{tenant_id}/schedule", response_model=SchedulePlanResponse, tags=["Schedule"])
 async def update_schedule(
     tenant_id: str,
@@ -1224,42 +1330,7 @@ async def update_schedule(
     """Заменить недельную сетку канала. Гейтится тарифом: scheduling, repost_mode
     (для repost-слотов) и max_posts_per_day на каждый день недели."""
     profile = await _require_tenant(principal, tenant_id)
-    tier = getattr(profile, "subscription_tier", None)
-
-    # Валидация формата слотов.
-    for s in req.slots:
-        if not 0 <= s.weekday <= 6:
-            raise HTTPException(status_code=422, detail="weekday must be 0..6 (Mon..Sun)")
-        if not _valid_hhmm(s.time):
-            raise HTTPException(status_code=422, detail=f"invalid time '{s.time}' (HH:MM)")
-        if s.content_type not in _CONTENT_TYPES:
-            raise HTTPException(status_code=422, detail="content_type must be 'topic' or 'repost'")
-
-    # Тариф (супер-админ не ограничен).
-    if not principal.is_super and req.slots:
-        if not allows(tier, "scheduling"):
-            _tier_feature_error("scheduling", tier)
-        if any(s.content_type == "repost" for s in req.slots) and not allows(tier, "repost_mode"):
-            _tier_feature_error("repost_mode", tier)
-        maxp = limit_of(tier, "max_posts_per_day")
-        per_day: dict[int, int] = {}
-        for s in req.slots:
-            if s.enabled:
-                per_day[s.weekday] = per_day.get(s.weekday, 0) + 1
-        worst = max(per_day.values(), default=0)
-        if not within_limit(worst, maxp):
-            _tier_quota_error("max_posts_per_day", worst, maxp, tier)
-
-    saved = await asyncio.to_thread(
-        replace_schedule_plan,
-        tenant_id,
-        [s.dict() for s in req.slots],
-    )
-    # Непустая сетка → schedule_mode="weekly"; пустая → "off" (выключить автопостинг).
-    await asyncio.to_thread(
-        update_tenant_profile, tenant_id,
-        schedule_mode="weekly" if req.slots else "off",
-    )
+    saved = await _apply_schedule_slots(profile, principal, req.slots)
     return SchedulePlanResponse(
         slots=[
             WeekdaySlotSchema(
