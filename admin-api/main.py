@@ -55,6 +55,8 @@ from database import (
     remove_tenant_rule,
     get_tenant_sources,
     get_recent_posts,
+    get_post,
+    mark_post_deleted,
     get_published_posts_since,
     get_schedule_plan,
     replace_schedule_plan,
@@ -1052,6 +1054,77 @@ async def get_posts(
         for p in posts[offset:offset + limit]
     ]
     return PostsListResponse(total=len(posts), posts=result)
+
+
+class DeletePostResponse(BaseModel):
+    success: bool
+    # True — сообщение реально удалено из Telegram-канала; False — осталось в канале
+    # (старое/нет прав/уже удалено вручную), но запись снята из панели и аналитики.
+    channel_deleted: bool
+    message: str
+
+
+async def _tg_delete_message(chat_id: str, message_id: int) -> Tuple[bool, str]:
+    """Удалить сообщение из канала через Telegram Bot API. Возвращает (ok, detail)."""
+    if not BOT_TOKEN:
+        return False, "bot token not configured"
+    client = _get_avatar_client()
+    try:
+        r = await client.post(
+            f"{_TG_API}/bot{BOT_TOKEN}/deleteMessage",
+            params={"chat_id": chat_id, "message_id": message_id},
+        )
+        data = r.json()
+        if data.get("ok"):
+            return True, "deleted"
+        return False, str(data.get("description") or "telegram error")
+    except Exception as e:  # сеть/таймаут — не валим весь запрос
+        return False, str(e)
+
+
+@app.delete(
+    "/api/admin/tenants/{tenant_id}/posts/{post_id}",
+    response_model=DeletePostResponse,
+    tags=["Posts"],
+)
+async def delete_post_endpoint(
+    tenant_id: str,
+    post_id: int,
+    principal: Principal = Depends(get_principal),
+) -> DeletePostResponse:
+    """Удалить пост канала: сначала из Telegram (deleteMessage), затем пометить
+    удалённым в истории (строка остаётся для аудита, но уходит из аналитики/ротации
+    /сбора метрик). Только супер-админ."""
+    _require_super(principal)
+    await _require_tenant(principal, tenant_id)
+
+    post = await asyncio.to_thread(get_post, post_id)
+    if not post or post.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.deleted:
+        raise HTTPException(status_code=409, detail="Post already deleted")
+
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    channel_deleted = False
+    detail = "no message_id on record"
+    if post.message_id:
+        channel_deleted, detail = await _tg_delete_message(profile.chat_id, post.message_id)
+
+    # Снимаем запись в любом случае — иначе удалённый из канала пост продолжит
+    # висеть в панели и портить аналитику. Если из канала удалить не вышло, фронт
+    # покажет предупреждение по channel_deleted=false.
+    await asyncio.to_thread(mark_post_deleted, post_id)
+
+    return DeletePostResponse(
+        success=True,
+        channel_deleted=channel_deleted,
+        message="Удалено из канала и панели"
+        if channel_deleted
+        else f"Снято в панели; из канала не удалено: {detail}",
+    )
 
 
 @app.get("/api/admin/tenants/{tenant_id}/sources", response_model=SourcesListResponse, tags=["Sources"])

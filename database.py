@@ -833,6 +833,13 @@ def get_recent_posts(tenant_id: str, limit: int = 5) -> List[PostHistory]:
         )
 
 
+def get_post(post_id: int) -> Optional[PostHistory]:
+    """Одна запись истории постов по id (None, если нет). Для admin-операций —
+    вызывающая сторона сама проверяет принадлежность tenant_id."""
+    with Session(engine, expire_on_commit=False) as session:
+        return session.get(PostHistory, post_id)
+
+
 def mark_post_deleted(post_id: int) -> bool:
     """Помечает пост удалённым из канала (его удалил админ в Telegram).
 
