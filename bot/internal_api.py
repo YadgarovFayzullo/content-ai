@@ -24,7 +24,7 @@ from database import (
     PostHistory,
     get_tenant_profile,
 )
-from orchestrator import generate_preview
+from orchestrator import generate_preview, _image_path_to_data_uri
 from publisher import send_to_telegram
 from repost import produce_content
 from bot.scheduler import index_source, scheduled_job
@@ -113,6 +113,54 @@ async def handle_publish(request: web.Request) -> web.Response:
             "message": detail,
         }
     )
+
+
+async def handle_preview(request: web.Request) -> web.Response:
+    """POST /internal/tenants/{tenant_id}/preview
+
+    Превью поста БЕЗ публикации и записи в историю — для repost/both-режимов, где
+    нужен Telethon-скрейп источников (есть только у бота). admin-api проксирует сюда
+    превью, когда content_mode = repost/both и тема не задана явно.
+
+    Body {topic?, context?, allow_image?}:
+      - явная topic → оригинальный пост на тему (репост — это переработка готовой
+        новости, а не пост на заданную тему), как и в topic-превью admin-api;
+      - иначе       → produce_content (та же ветвящаяся генерация, что и автопостинг:
+        repost / both-с-фолбэком-в-topic), но без публикации.
+    Возвращает {text, topic, image} (image — data-URI base64 или "").
+    """
+    _check_auth(request)
+    tenant_id = request.match_info["tenant_id"]
+    body = await request.json() if request.can_read_body else {}
+
+    profile = await asyncio.to_thread(get_tenant_profile, tenant_id)
+    if not profile:
+        raise web.HTTPNotFound(reason="tenant not found")
+
+    topic = (body.get("topic") or "").strip()
+    context = (body.get("context") or "").strip()
+    allow_image = body.get("allow_image", True)
+
+    try:
+        if topic:
+            result = await asyncio.to_thread(
+                generate_preview, tenant_id, topic, context or None
+            )
+            return web.json_response(result)
+
+        # repost/both: produce_content сам ветвится и НЕ публикует (entry сохранит
+        # publisher только после реальной публикации) — для превью безопасно.
+        content = await produce_content(profile, with_image=allow_image)
+        image = _image_path_to_data_uri(content.get("image_path")) if allow_image else ""
+        return web.json_response(
+            {
+                "text": content["text"],
+                "topic": getattr(content.get("entry"), "topic", "") or "repost",
+                "image": image,
+            }
+        )
+    except RuntimeError as e:
+        return web.json_response({"success": False, "message": str(e)}, status=502)
 
 
 async def handle_publish_all(request: web.Request) -> web.Response:
@@ -208,6 +256,10 @@ def create_internal_app(bot: Bot) -> web.Application:
         "/internal/tenants/{tenant_id}/publish", handle_publish
     )
     app.router.add_post("/internal/publish-all", handle_publish_all)
+    # Превью поста для repost/both-режимов (нужен Telethon-скрейп источников).
+    app.router.add_post(
+        "/internal/tenants/{tenant_id}/preview", handle_preview
+    )
     app.router.add_post(
         "/internal/tenants/{tenant_id}/index-source", handle_index_source
     )

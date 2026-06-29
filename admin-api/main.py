@@ -1652,10 +1652,37 @@ async def generate_post_preview(
     req: GenerateRequest,
     principal: Principal = Depends(get_principal),
 ) -> GenerateResponse:
-    """Сгенерировать ТЕКСТ поста под стиль канала (превью). Не публикует."""
-    from orchestrator import generate_preview
+    """Сгенерировать ТЕКСТ поста под стиль канала (превью). Не публикует.
 
-    await _require_tenant(principal, tenant_id)
+    Превью совпадает с автопостингом по content_mode: в repost/both-режиме (без явной
+    темы) пост — это пересборка свежей новости из источников, для чего нужен
+    Telethon-скрейп. У admin-api Telethon нет, поэтому такой превью делегируется боту
+    (/internal/.../preview). Topic-режим (и любой запрос с явной темой) генерируется
+    локально — Telethon не требуется.
+    """
+    profile = await _require_tenant(principal, tenant_id)
+
+    explicit = bool((req.topic or "").strip())
+    mode = (getattr(profile, "content_mode", "topic") or "topic").lower()
+    repost_allowed = principal.is_super or allows(profile.subscription_tier, "repost_mode")
+
+    if not explicit and mode in ("repost", "both") and repost_allowed:
+        body = {
+            "topic": req.topic,
+            "context": req.context,
+            "allow_image": principal.is_super
+            or allows(profile.subscription_tier, "image_generation"),
+        }
+        result = await _proxy_to_bot(
+            "POST", f"/internal/tenants/{tenant_id}/preview", body
+        )
+        return GenerateResponse(
+            text=result.get("text", ""),
+            topic=result.get("topic", ""),
+            image=result.get("image", ""),
+        )
+
+    from orchestrator import generate_preview
 
     try:
         result = await asyncio.to_thread(

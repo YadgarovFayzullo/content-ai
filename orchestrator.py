@@ -227,6 +227,20 @@ def generate_for_tenant(profile: TenantProfile, with_image: bool = True) -> Gene
     return GeneratedContent(text=post_text, image_path=image_path, entry=entry)
 
 
+def _image_path_to_data_uri(image_path: str | None) -> str:
+    """Картинку с диска → data-URI base64 (для JSON-ответа превью). "" при пустом
+    пути или ошибке чтения."""
+    if not image_path:
+        return ""
+    try:
+        data = Path(image_path).read_bytes()
+        mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+        return f"data:{mime};base64," + base64.b64encode(data).decode()
+    except Exception as e:
+        logging.warning(f"Preview-rasmni o'qib bo'lmadi ({image_path}): {e}")
+        return ""
+
+
 def generate_preview(
     tenant_id: str,
     topic: str | None = None,
@@ -246,8 +260,10 @@ def generate_preview(
     if profile is None:
         raise RuntimeError("Tenant profili topilmadi")
 
-    # Явная тема от оператора уважается (repick не делаем) — дедуп сводится к
-    # «обнови угол». Пустая тема → ротация с дедупом, как в автопостинге.
+    # Внимание: это ТОЛЬКО topic-генерация. Репост-превью (content_mode=repost/both)
+    # делает бот — у него есть Telethon-сессия для скрейпа источников и постоянный
+    # event loop. admin-api в repost/both-режиме проксирует превью в бот
+    # (см. /internal/tenants/{id}/preview), сюда попадает только topic-путь.
     explicit = (topic or "").strip()
     if explicit:
         chosen_topic, forced_repeat = explicit, True
@@ -279,14 +295,9 @@ def generate_preview(
 
     # Картинку отдаём как data-URI (base64): admin-api не раздаёт файлы статикой, а
     # одна картинка превью прекрасно влезает в JSON-ответ (без файлов/очистки/nginx).
-    image_data_uri = ""
     image_path = _make_image(profile, ctx, chosen_topic, label=f"preview:{tenant_id}")
-    if image_path:
-        try:
-            data = Path(image_path).read_bytes()
-            mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
-            image_data_uri = f"data:{mime};base64," + base64.b64encode(data).decode()
-        except Exception as e:
-            logging.warning(f"Preview-rasmni o'qib bo'lmadi ({tenant_id}): {e}")
-
-    return {"text": post_text, "topic": chosen_topic, "image": image_data_uri}
+    return {
+        "text": post_text,
+        "topic": chosen_topic,
+        "image": _image_path_to_data_uri(image_path),
+    }
