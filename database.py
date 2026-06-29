@@ -202,6 +202,13 @@ class ChannelStat(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     tenant_id: str = Field(index=True)
     subscribers: int = 0
+    # Канал-уровневый охват за окно сбора: суммарные метрики ВСЕХ постов канала
+    # (включая опубликованные не нашим сервисом), снятые тем же проходом. None —
+    # охват не собирался (Telethon недоступен / канал не отдал историю).
+    total_views: Optional[int] = None
+    total_forwards: Optional[int] = None
+    total_reactions: Optional[int] = None
+    post_count: Optional[int] = None
     captured_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
@@ -417,6 +424,12 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     },
     "tenant_rules": {"is_system": "BOOLEAN DEFAULT FALSE"},
     "tenant_sources": {"priority": "INTEGER DEFAULT 0"},
+    "channel_stats": {
+        "total_views": "INTEGER",
+        "total_forwards": "INTEGER",
+        "total_reactions": "INTEGER",
+        "post_count": "INTEGER",
+    },
 }
 
 
@@ -1330,11 +1343,18 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
     """
     since = _utcnow() - timedelta(days=days)
     subs = get_channel_subscribers(tenant_id)  # последний снимок подписчиков (или None)
+    reach = get_channel_reach(tenant_id)       # канал-уровневый охват (все посты), или None
     subs_summary = {
         "subscribers": subs["subscribers"] if subs else None,
         "subscribers_at": subs["captured_at"] if subs else None,
         "subscribers_delta": subs["delta"] if subs else None,
         "subscribers_series": get_channel_subscriber_series(tenant_id),
+        # Канал-уровневый охват: суммарные метрики ВСЕХ постов канала за окно сбора
+        # (включая опубликованные не нашим сервисом). None, пока не собран.
+        "channel_total_views": reach["total_views"] if reach else None,
+        "channel_total_forwards": reach["total_forwards"] if reach else None,
+        "channel_total_reactions": reach["total_reactions"] if reach else None,
+        "channel_post_count": reach["post_count"] if reach else None,
     }
     empty = {
         "summary": {
@@ -1465,10 +1485,26 @@ def save_metric(
         return metric
 
 
-def save_channel_stat(tenant_id: str, subscribers: int) -> ChannelStat:
-    """Сохраняет снимок числа подписчиков канала."""
+def save_channel_stat(
+    tenant_id: str,
+    subscribers: int,
+    *,
+    total_views: Optional[int] = None,
+    total_forwards: Optional[int] = None,
+    total_reactions: Optional[int] = None,
+    post_count: Optional[int] = None,
+) -> ChannelStat:
+    """Сохраняет снимок числа подписчиков канала + (опц.) канал-уровневый охват
+    за окно сбора (суммарные метрики всех постов канала, не только наших)."""
     with Session(engine, expire_on_commit=False) as session:
-        stat = ChannelStat(tenant_id=tenant_id, subscribers=subscribers)
+        stat = ChannelStat(
+            tenant_id=tenant_id,
+            subscribers=subscribers,
+            total_views=total_views,
+            total_forwards=total_forwards,
+            total_reactions=total_reactions,
+            post_count=post_count,
+        )
         session.add(stat)
         session.commit()
         session.refresh(stat)
@@ -1495,6 +1531,29 @@ def get_channel_subscribers(tenant_id: str) -> Optional[dict]:
             "subscribers": latest.subscribers,
             "captured_at": latest.captured_at.isoformat() if latest.captured_at else None,
             "delta": delta,
+        }
+
+
+def get_channel_reach(tenant_id: str) -> Optional[dict]:
+    """Последний снимок канал-уровневого охвата (суммарные метрики ВСЕХ постов
+    канала за окно сбора, включая опубликованные не нашим сервисом). None, если
+    охват ещё ни разу не собирался. Берём последнюю строку с заполненным total_views."""
+    with Session(engine, expire_on_commit=False) as session:
+        row = session.exec(
+            select(ChannelStat)
+            .where(ChannelStat.tenant_id == tenant_id)
+            .where(ChannelStat.total_views.is_not(None))  # type: ignore[union-attr]
+            .order_by(ChannelStat.captured_at.desc())
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+        return {
+            "total_views": row.total_views or 0,
+            "total_forwards": row.total_forwards or 0,
+            "total_reactions": row.total_reactions or 0,
+            "post_count": row.post_count or 0,
+            "captured_at": row.captured_at.isoformat() if row.captured_at else None,
         }
 
 

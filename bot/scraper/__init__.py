@@ -22,6 +22,7 @@ from bot.scraper.telegram import (
     get_broadcast_stats,
     get_channel_title,
     get_subscriber_count,
+    scrape_channel_engagement,
     scrape_channel_history,
 )
 from bot.scraper.text import _is_url
@@ -35,6 +36,7 @@ __all__ = [
     "get_channel_title",
     "get_subscriber_count",
     "get_broadcast_stats",
+    "scrape_channel_engagement",
     "_creds_ready",
     "_get_client",
     "_peer",

@@ -82,6 +82,49 @@ async def get_broadcast_stats(chat_id: Any) -> Optional[dict]:
         return None
 
 
+def _msg_reactions(msg) -> int:
+    """Сумма реакций сообщения (или 0)."""
+    reactions = getattr(msg, "reactions", None)
+    if not reactions or not getattr(reactions, "results", None):
+        return 0
+    return sum(getattr(r, "count", 0) or 0 for r in reactions.results)
+
+
+async def scrape_channel_engagement(
+    chat_id: Any, since: "datetime", limit: int = 400
+) -> Optional[dict]:
+    """Канал-уровневый охват за окно `since..now`: суммарные просмотры/пересылки/
+    реакции ВСЕХ постов канала, а не только опубликованных нашим сервисом.
+
+    Считает каждый пост канала (включая опубликованные вручную/из других источников),
+    поэтому даёт честные «просмотры канала», когда мы публикуем лишь часть контента.
+    Возвращает {"total_views", "total_forwards", "total_reactions", "post_count"} или
+    None (Telethon не настроен / канал недоступен)."""
+    if not _creds_ready():
+        return None
+    try:
+        client = await _get_client()
+        entity = await client.get_entity(_peer(chat_id))
+        views = forwards = reactions = count = 0
+        async for msg in client.iter_messages(entity, limit=limit):
+            mdate = getattr(msg, "date", None)
+            if mdate is not None and mdate < since:
+                break  # история идёт от свежих к старым — дальше всё вне окна
+            count += 1
+            views += int(getattr(msg, "views", 0) or 0)
+            forwards += int(getattr(msg, "forwards", 0) or 0)
+            reactions += _msg_reactions(msg)
+        return {
+            "total_views": views,
+            "total_forwards": forwards,
+            "total_reactions": reactions,
+            "post_count": count,
+        }
+    except Exception as e:
+        logging.warning("Kanal qamrovini olishda xato (%s): %s", chat_id, e)
+        return None
+
+
 async def scrape_channel_history(
     chat_id: str, limit: int = 200
 ) -> list[dict[str, Any]]:

@@ -27,6 +27,7 @@ from bot.scraper import (
     _peer,
     get_broadcast_stats,
     get_subscriber_count,
+    scrape_channel_engagement,
 )
 
 # Окно сбора: посты старше уже стабилизировались, их не переснимаем.
@@ -47,13 +48,25 @@ async def collect_subscriber_counts() -> int:
     if not _creds_ready():
         return 0
     tenants = await asyncio.to_thread(get_active_tenants)
+    since = datetime.now(timezone.utc) - timedelta(days=METRICS_WINDOW_DAYS)
     saved = 0
     for profile in tenants:
         try:
             count = await get_subscriber_count(profile.chat_id)
             if count is None:
                 continue
-            await asyncio.to_thread(save_channel_stat, profile.tenant_id, count)
+            # Канал-уровневый охват за окно: суммарные метрики ВСЕХ постов канала
+            # (включая опубликованные не нашим сервисом) — снимаем тем же проходом.
+            reach = await scrape_channel_engagement(profile.chat_id, since)
+            await asyncio.to_thread(
+                save_channel_stat,
+                profile.tenant_id,
+                count,
+                total_views=reach.get("total_views") if reach else None,
+                total_forwards=reach.get("total_forwards") if reach else None,
+                total_reactions=reach.get("total_reactions") if reach else None,
+                post_count=reach.get("post_count") if reach else None,
+            )
             saved += 1
         except Exception as e:
             logging.error("Obunachilar xatosi (%s): %s", profile.chat_id, e)
