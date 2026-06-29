@@ -202,13 +202,18 @@ class ChannelStat(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     tenant_id: str = Field(index=True)
     subscribers: int = 0
-    # Канал-уровневый охват за окно сбора: суммарные метрики ВСЕХ постов канала
-    # (включая опубликованные не нашим сервисом), снятые тем же проходом. None —
-    # охват не собирался (Telethon недоступен / канал не отдал историю).
+    # Канал-уровневый охват: суммарные метрики ВСЕХ постов канала (включая
+    # опубликованные не нашим сервисом), снятые тем же проходом за НЕСКОЛЬКО окон.
+    # total_*/post_count — окно 7 дней (исторически); *_30d/*_90d — 30 и 90 дней.
+    # None — охват не собирался (Telethon недоступен / канал не отдал историю).
     total_views: Optional[int] = None
     total_forwards: Optional[int] = None
     total_reactions: Optional[int] = None
     post_count: Optional[int] = None
+    views_30d: Optional[int] = None
+    posts_30d: Optional[int] = None
+    views_90d: Optional[int] = None
+    posts_90d: Optional[int] = None
     captured_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
@@ -429,6 +434,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "total_forwards": "INTEGER",
         "total_reactions": "INTEGER",
         "post_count": "INTEGER",
+        "views_30d": "INTEGER",
+        "posts_30d": "INTEGER",
+        "views_90d": "INTEGER",
+        "posts_90d": "INTEGER",
     },
 }
 
@@ -1349,12 +1358,10 @@ def get_tenant_stats(tenant_id: str, days: int = 30, limit: int = 20) -> dict:
         "subscribers_at": subs["captured_at"] if subs else None,
         "subscribers_delta": subs["delta"] if subs else None,
         "subscribers_series": get_channel_subscriber_series(tenant_id),
-        # Канал-уровневый охват: суммарные метрики ВСЕХ постов канала за окно сбора
-        # (включая опубликованные не нашим сервисом). None, пока не собран.
-        "channel_total_views": reach["total_views"] if reach else None,
-        "channel_total_forwards": reach["total_forwards"] if reach else None,
-        "channel_total_reactions": reach["total_reactions"] if reach else None,
-        "channel_post_count": reach["post_count"] if reach else None,
+        # Канал-уровневый охват: суммарные просмотры ВСЕХ постов канала по окнам
+        # 7/30/90 дней (включая опубликованные не нашим сервисом). None, пока не
+        # собран. channel_reach.ranges = {"7d": {views, posts}, "30d", "90d"}.
+        "channel_reach": reach,
     }
     empty = {
         "summary": {
@@ -1489,21 +1496,29 @@ def save_channel_stat(
     tenant_id: str,
     subscribers: int,
     *,
-    total_views: Optional[int] = None,
-    total_forwards: Optional[int] = None,
-    total_reactions: Optional[int] = None,
-    post_count: Optional[int] = None,
+    reach: Optional[dict] = None,
 ) -> ChannelStat:
-    """Сохраняет снимок числа подписчиков канала + (опц.) канал-уровневый охват
-    за окно сбора (суммарные метрики всех постов канала, не только наших)."""
+    """Сохраняет снимок числа подписчиков канала + (опц.) канал-уровневый охват за
+    несколько окон (суммарные метрики всех постов канала, не только наших).
+
+    reach — результат scrape_channel_engagement: {метка: {views, forwards, reactions,
+    post_count}} для меток "7d"/"30d"/"90d". None — охват не собирался."""
+    reach = reach or {}
+    w7 = reach.get("7d") or {}
+    w30 = reach.get("30d") or {}
+    w90 = reach.get("90d") or {}
     with Session(engine, expire_on_commit=False) as session:
         stat = ChannelStat(
             tenant_id=tenant_id,
             subscribers=subscribers,
-            total_views=total_views,
-            total_forwards=total_forwards,
-            total_reactions=total_reactions,
-            post_count=post_count,
+            total_views=w7.get("views"),
+            total_forwards=w7.get("forwards"),
+            total_reactions=w7.get("reactions"),
+            post_count=w7.get("post_count"),
+            views_30d=w30.get("views"),
+            posts_30d=w30.get("post_count"),
+            views_90d=w90.get("views"),
+            posts_90d=w90.get("post_count"),
         )
         session.add(stat)
         session.commit()
@@ -1536,8 +1551,11 @@ def get_channel_subscribers(tenant_id: str) -> Optional[dict]:
 
 def get_channel_reach(tenant_id: str) -> Optional[dict]:
     """Последний снимок канал-уровневого охвата (суммарные метрики ВСЕХ постов
-    канала за окно сбора, включая опубликованные не нашим сервисом). None, если
-    охват ещё ни разу не собирался. Берём последнюю строку с заполненным total_views."""
+    канала, включая опубликованные не нашим сервисом) по окнам 7/30/90 дней. None,
+    если охват ещё ни разу не собирался. Берём последнюю строку с total_views.
+
+    Возвращает {"ranges": {"7d": {views, posts}, "30d": {...}, "90d": {...}},
+    "captured_at"}. Окна без данных (старые снимки до апдейта) → None в полях."""
     with Session(engine, expire_on_commit=False) as session:
         row = session.exec(
             select(ChannelStat)
@@ -1549,10 +1567,11 @@ def get_channel_reach(tenant_id: str) -> Optional[dict]:
         if row is None:
             return None
         return {
-            "total_views": row.total_views or 0,
-            "total_forwards": row.total_forwards or 0,
-            "total_reactions": row.total_reactions or 0,
-            "post_count": row.post_count or 0,
+            "ranges": {
+                "7d": {"views": row.total_views or 0, "posts": row.post_count or 0},
+                "30d": {"views": row.views_30d, "posts": row.posts_30d},
+                "90d": {"views": row.views_90d, "posts": row.posts_90d},
+            },
             "captured_at": row.captured_at.isoformat() if row.captured_at else None,
         }
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -91,35 +92,46 @@ def _msg_reactions(msg) -> int:
 
 
 async def scrape_channel_engagement(
-    chat_id: Any, since: "datetime", limit: int = 400
+    chat_id: Any, windows: dict[str, int], limit: int = 600
 ) -> Optional[dict]:
-    """Канал-уровневый охват за окно `since..now`: суммарные просмотры/пересылки/
-    реакции ВСЕХ постов канала, а не только опубликованных нашим сервисом.
+    """Канал-уровневый охват за НЕСКОЛЬКО окон сразу: суммарные просмотры/пересылки/
+    реакции ВСЕХ постов канала (а не только опубликованных нашим сервисом).
 
     Считает каждый пост канала (включая опубликованные вручную/из других источников),
     поэтому даёт честные «просмотры канала», когда мы публикуем лишь часть контента.
-    Возвращает {"total_views", "total_forwards", "total_reactions", "post_count"} или
-    None (Telethon не настроен / канал недоступен)."""
-    if not _creds_ready():
+    Один проход по истории покрывает все окна: `windows` = {метка: дней} (напр.
+    {"7d": 7, "30d": 30, "90d": 90}); идём от свежих к старым до самого широкого окна
+    и набираем суммы в каждое окно, чьему порогу пост ещё удовлетворяет.
+
+    Возвращает {метка: {"views", "forwards", "reactions", "post_count"}} или None
+    (Telethon не настроен / канал недоступен / нет окон)."""
+    if not _creds_ready() or not windows:
         return None
+    now = datetime.now(timezone.utc)
+    thresholds = {label: now - timedelta(days=days) for label, days in windows.items()}
+    widest = min(thresholds.values())
+    agg = {
+        label: {"views": 0, "forwards": 0, "reactions": 0, "post_count": 0}
+        for label in windows
+    }
     try:
         client = await _get_client()
         entity = await client.get_entity(_peer(chat_id))
-        views = forwards = reactions = count = 0
         async for msg in client.iter_messages(entity, limit=limit):
             mdate = getattr(msg, "date", None)
-            if mdate is not None and mdate < since:
-                break  # история идёт от свежих к старым — дальше всё вне окна
-            count += 1
-            views += int(getattr(msg, "views", 0) or 0)
-            forwards += int(getattr(msg, "forwards", 0) or 0)
-            reactions += _msg_reactions(msg)
-        return {
-            "total_views": views,
-            "total_forwards": forwards,
-            "total_reactions": reactions,
-            "post_count": count,
-        }
+            if mdate is not None and mdate < widest:
+                break  # история идёт от свежих к старым — дальше всё вне окон
+            v = int(getattr(msg, "views", 0) or 0)
+            f = int(getattr(msg, "forwards", 0) or 0)
+            r = _msg_reactions(msg)
+            for label, threshold in thresholds.items():
+                if mdate is None or mdate >= threshold:
+                    a = agg[label]
+                    a["views"] += v
+                    a["forwards"] += f
+                    a["reactions"] += r
+                    a["post_count"] += 1
+        return agg
     except Exception as e:
         logging.warning("Kanal qamrovini olishda xato (%s): %s", chat_id, e)
         return None

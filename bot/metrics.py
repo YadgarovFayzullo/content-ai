@@ -33,6 +33,10 @@ from bot.scraper import (
 # Окно сбора: посты старше уже стабилизировались, их не переснимаем.
 METRICS_WINDOW_DAYS = 7
 
+# Окна канал-уровневого охвата (просмотры всех постов канала) — селектор в дашборде:
+# неделя / месяц / 3 месяца. Один проход по истории канала покрывает все три.
+REACH_WINDOWS = {"7d": 7, "30d": 30, "90d": 90}
+
 
 def _count_reactions(msg) -> int:
     reactions = getattr(msg, "reactions", None)
@@ -48,24 +52,20 @@ async def collect_subscriber_counts() -> int:
     if not _creds_ready():
         return 0
     tenants = await asyncio.to_thread(get_active_tenants)
-    since = datetime.now(timezone.utc) - timedelta(days=METRICS_WINDOW_DAYS)
     saved = 0
     for profile in tenants:
         try:
             count = await get_subscriber_count(profile.chat_id)
             if count is None:
                 continue
-            # Канал-уровневый охват за окно: суммарные метрики ВСЕХ постов канала
-            # (включая опубликованные не нашим сервисом) — снимаем тем же проходом.
-            reach = await scrape_channel_engagement(profile.chat_id, since)
+            # Канал-уровневый охват по окнам 7/30/90 дней: суммарные метрики ВСЕХ
+            # постов канала (включая опубликованные не нашим сервисом) — один проход
+            # по истории покрывает все окна.
+            reach = await scrape_channel_engagement(
+                profile.chat_id, REACH_WINDOWS
+            )
             await asyncio.to_thread(
-                save_channel_stat,
-                profile.tenant_id,
-                count,
-                total_views=reach.get("total_views") if reach else None,
-                total_forwards=reach.get("total_forwards") if reach else None,
-                total_reactions=reach.get("total_reactions") if reach else None,
-                post_count=reach.get("post_count") if reach else None,
+                save_channel_stat, profile.tenant_id, count, reach=reach
             )
             saved += 1
         except Exception as e:
