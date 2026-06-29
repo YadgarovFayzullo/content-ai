@@ -35,7 +35,7 @@ from database import (
     get_tenant_stats,
     get_window_post_metrics,
 )
-from tiers import allows, is_unlimited, limit_of
+from tiers import allows, is_unlimited, limit_of, normalize_tier
 
 # Минимум постов в окне, ниже которого почасовая разбивка и прогноз статистически
 # бессмысленны (1–2 поста дают «100% активности в один час» — это шум, не сигнал).
@@ -242,6 +242,18 @@ def build_insights(tenant_id: str, days: int = 30, tz: Optional[str] = None) -> 
     window_posts = get_window_post_metrics(tenant_id, days)
     broadcast = get_latest_broadcast_stat(tenant_id)
 
+    # Потолок тарифа канала — чтобы LLM-слой не обещал больше постов/день, чем
+    # реально разрешено (иначе устный совет «2 поста» расходится с карточкой,
+    # которую backend зажимает до лимита тарифа).
+    profile = get_tenant_profile(tenant_id)
+    tier = normalize_tier(getattr(profile, "subscription_tier", "starter"))
+    tier_info = {
+        "name": tier,
+        "scheduling": allows(tier, "scheduling"),
+        "max_posts_per_day": limit_of(tier, "max_posts_per_day"),
+        "repost_mode": allows(tier, "repost_mode"),
+    }
+
     subs = summary.get("subscribers")
     avg_views = summary.get("avg_views_per_post", 0)
 
@@ -280,6 +292,7 @@ def build_insights(tenant_id: str, days: int = 30, tz: Optional[str] = None) -> 
                 "а не точная доля активных."
             ),
         },
+        "tier": tier_info,
         "active_hours": _localize_active_hours(_peak_hours(window_posts), tz),
         "topic_contrast": _topic_contrast(by_topic),
         "forecast": _forecast(
@@ -305,6 +318,27 @@ def _insights_to_prompt(insights: dict) -> str:
     ]
     if s.get("subscribers_delta") is not None:
         lines.append(f"Изменение числа подписчиков за период: {s['subscribers_delta']:+d}.")
+
+    tier = insights.get("tier")
+    if tier:
+        if not tier.get("scheduling"):
+            lines.append(
+                f"Тариф канала: {tier['name']}. Автопостинг по расписанию на этом тарифе "
+                "НЕдоступен (нужен апгрейд) — не предлагай настроить расписание."
+            )
+        else:
+            maxp = tier.get("max_posts_per_day")
+            if isinstance(maxp, int) and maxp >= 0:
+                lines.append(
+                    f"Тариф канала: {tier['name']}. ПОТОЛОК автопостинга: {maxp} пост(ов)/день. "
+                    f"НИКОГДА не рекомендуй, не обещай и не указывай больше {maxp} постов в день — "
+                    "это жёсткий лимит тарифа (для большего нужен апгрейд)."
+                )
+        if not tier.get("repost_mode"):
+            lines.append(
+                "Режим репостов (пересборка чужих новостей) на этом тарифе недоступен — "
+                'в рекомендациях по расписанию используй только тип "topic".'
+            )
 
     active = insights.get("active", {})
     if active.get("reach_rate_pct") is not None:
@@ -602,7 +636,14 @@ _SYSTEM_PROMPT = (
     "Пример для «2 поста в день, первый репост, второй тема»: "
     "[[SCHEDULE_ACTION]]{\"posts_per_day\": 2, \"content_split\": [\"repost\", \"topic\"]}[[/SCHEDULE_ACTION]]. "
     "Добавляй этот блок ТОЛЬКО когда реально рекомендуешь расписание; если про "
-    "расписание речи нет — блок не добавляй."
+    "расписание речи нет — блок не добавляй.\n\n"
+    "ПОТОЛОК ТАРИФА (КРИТИЧНО): в блоке данных указан потолок автопостинга — сколько "
+    "постов в день максимум разрешено тарифом канала. НИКОГДА не рекомендуй, не обещай "
+    "словами и не указывай в служебном блоке (posts_per_day / content_split) больше "
+    "постов в день, чем этот потолок. Если по данным оптимально было бы больше — назови "
+    "потолок тарифа честно и предложи апгрейд, но сама рекомендация и блок ОБЯЗАНЫ "
+    "оставаться в пределах потолка. Если автопостинг на тарифе недоступен — не предлагай "
+    "настроить расписание вовсе."
 )
 
 
