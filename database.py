@@ -1060,6 +1060,57 @@ def save_repost_story(
         return story
 
 
+def is_repost_text_duplicate(
+    tenant_id: str, text_content: str, days: int = 14, min_sim: float = 0.5
+) -> bool:
+    """True, если канонический текст репоста триграммно похож (≥ min_sim) на любой
+    пост, опубликованный за последние `days` дней.
+
+    Фолбэк-дедуп, НЕ зависящий от эмбеддингов: закрывает окна, когда RAG /embed
+    недоступен и семантический дедуп (RepostStory-центроиды) слеп — тогда одна и та
+    же новость иначе проскочит. Сравниваем по нормализованному префиксу (первые 500
+    символов): у пересобранной той же новости начало совпадает, а длина текста не
+    искажает триграммную близость. Только Postgres (pg_trgm); на SQLite — грубое
+    сравнение по нормализованному префиксу."""
+    q = " ".join((text_content or "").split())[:500]
+    if not q:
+        return False
+    since = _utcnow() - timedelta(days=days)
+
+    if _IS_PG:
+        sql = text(
+            """
+            SELECT 1
+            FROM posts_history
+            WHERE tenant_id = :tid
+              AND posted = TRUE
+              AND deleted = FALSE
+              AND created_at >= :since
+              AND similarity(left(content, 500), :q) >= :sim
+            LIMIT 1
+            """
+        )
+        with engine.begin() as conn:
+            row = conn.execute(
+                sql, {"tid": tenant_id, "since": since, "q": q, "sim": min_sim}
+            ).first()
+        return row is not None
+
+    # SQLite-фолбэк (dev): грубое совпадение нормализованного префикса.
+    nq = q.lower()[:120]
+    with Session(engine, expire_on_commit=False) as session:
+        recent = session.exec(
+            select(PostHistory.content)
+            .where(PostHistory.tenant_id == tenant_id)
+            .where(PostHistory.posted == True)  # noqa: E712
+            .where(PostHistory.deleted == False)  # noqa: E712
+            .where(PostHistory.created_at >= since)
+        ).all()
+    return bool(nq) and any(
+        nq in " ".join((c or "").split())[:500].lower() for c in recent
+    )
+
+
 def get_recent_repost_centroids(tenant_id: str, days: int = 14) -> List[List[float]]:
     """Центроиды историй, опубликованных за последние `days` дней (для дедупа)."""
     since = _utcnow() - timedelta(days=days)

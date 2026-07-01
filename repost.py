@@ -33,6 +33,7 @@ from database import (
     get_recent_repost_centroids,
     get_tenant_rules,
     get_tenant_sources,
+    is_repost_text_duplicate,
 )
 from generator import (
     canonicalize_cluster,
@@ -60,6 +61,11 @@ MIN_POST_CHARS = int(os.getenv("REPOST_MIN_CHARS", "40"))
 CLUSTER_THRESHOLD = float(os.getenv("REPOST_CLUSTER_THRESHOLD", "0.86"))
 DEDUP_THRESHOLD = float(os.getenv("REPOST_DEDUP_THRESHOLD", "0.83"))
 DEDUP_DAYS = int(os.getenv("REPOST_DEDUP_DAYS", "14"))
+
+# Текстовый фолбэк-дедуп (pg_trgm по канону) — НЕ зависит от эмбеддингов и ловит
+# повтор даже когда RAG /embed лежит и семантический дедуп слеп. Триграммная
+# близость префикса; порог консервативный (двойной постинг хуже редкого пропуска).
+TEXT_DEDUP_SIM = float(os.getenv("REPOST_TEXT_DEDUP_SIM", "0.5"))
 
 # Картинка для репоста — REPOST_IMAGE_MODE:
 #   "card"     (по умолчанию) — чистое тематическое фото из интернета (Pexels) по
@@ -108,6 +114,17 @@ def clean_candidates(posts: List[dict]) -> List[dict]:
 
 def _key(c: dict) -> str:
     return f"{c['source_chat_id']}:{c['id']}"
+
+
+async def _is_recent_text_dup(profile, text: str) -> bool:
+    """Триграммный дедуп канона против недавно опубликованных постов канала.
+
+    Работает независимо от эмбеддингов — единственная защита от повтора, когда
+    RAG /embed недоступен (V1-фолбэк) или у ранее опубликованной истории не
+    сохранился центроид."""
+    return await asyncio.to_thread(
+        is_repost_text_duplicate, profile.tenant_id, text, DEDUP_DAYS, TEXT_DEDUP_SIM
+    )
 
 
 async def _attach_image(profile, primary: dict, text: str) -> str:
@@ -253,6 +270,10 @@ async def _build_clustered(
     text = await asyncio.to_thread(
         canonicalize_cluster, profile, member_texts, rule_views
     )
+    # Текстовый фолбэк-дедуп: подстраховка семантического (см. _build_single).
+    if await _is_recent_text_dup(profile, text):
+        logging.info("Repost (klaster): matn dublikat — o'tkazib yuborildi (%s)", profile.chat_id)
+        return None
     image_path = await _attach_image(profile, primary, text)
 
     entry = _make_entry(profile, text, image_path, primary)
@@ -279,6 +300,13 @@ async def _build_single(profile, candidates: List[dict], rule_views) -> Optional
     text = await asyncio.to_thread(
         rewrite_source_post, profile, primary["text"], rule_views
     )
+    # Текстовый фолбэк-дедуп: в V1 (без эмбеддингов) семантического дедупа нет
+    # вовсе, поэтому это единственная защита от повтора той же новости из другого
+    # источника. Ловит и повторную пересборку истории, опубликованной, пока /embed
+    # лежал (той не сохранился центроид → семантический дедуп её не видит).
+    if await _is_recent_text_dup(profile, text):
+        logging.info("Repost (V1): matn dublikat — o'tkazib yuborildi (%s)", profile.chat_id)
+        return None
     image_path = await _attach_image(profile, primary, text)
     entry = _make_entry(profile, text, image_path, primary)
     # story_* не заполняем: без эмбеддинга нет centroid; дедуп держится на
