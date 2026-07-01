@@ -31,6 +31,11 @@ COPY image_search.py .
 # /ai-chat. Imports database + generator (both copied above).
 COPY analytics_agent.py .
 
+# X/Twitter cross-posting: OAuth token exchange/refresh + tweet publishing.
+# main.py imports it for the connect/callback endpoints; it lazily imports
+# generator (tweetify) + database (both copied above).
+COPY twitter_publisher.py .
+
 # Expose port
 EXPOSE 8001
 
