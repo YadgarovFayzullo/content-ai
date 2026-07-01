@@ -290,6 +290,44 @@ class AuthSession(SQLModel, table=True):
     expires_at: datetime
 
 
+class TwitterAccount(SQLModel, table=True):
+    """Подключённый X/Twitter-аккаунт, привязанный к Telegram-тенанту (1:1).
+
+    Кросс-постинг: после успешной публикации в Telegram-канал тот же контент
+    (в короткой ≤280-версии) зеркалится в этот X-аккаунт. Токены OAuth2 хранятся
+    ЗАШИФРОВАННЫМИ (Fernet, ключ TWITTER_TOKEN_KEY) — см. _enc/_dec.
+    """
+
+    __tablename__ = "twitter_accounts"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(unique=True, index=True)
+    twitter_user_id: str
+    screen_name: str = ""
+    access_token_enc: str
+    refresh_token_enc: str
+    # Когда истекает access-токен (X отдаёт ~2 часа) — рефрешим заранее.
+    token_expires_at: datetime
+    active: bool = True
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class TwitterOAuthState(SQLModel, table=True):
+    """Короткоживущее pending-состояние OAuth2-подключения X (PKCE).
+
+    Держит связку state→(tenant_id, code_verifier) между шагом «отдать authorize
+    URL» и callback'ом от X. Одноразовое: pop_twitter_oauth_state удаляет запись.
+    """
+
+    __tablename__ = "twitter_oauth_states"
+
+    state: str = Field(primary_key=True)
+    tenant_id: str = Field(index=True)
+    code_verifier: str
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class ScheduleSlot(SQLModel, table=True):
     """Персистентный дедуп автопостинга по расписанию.
 
@@ -744,6 +782,155 @@ def delete_auth_session(token: str) -> bool:
         return True
 
 
+# --- Подключение X/Twitter (OAuth2 + кросс-постинг) ---------------------------
+
+# Pending OAuth-состояние живёт 10 минут — этого хватает на редирект/авторизацию.
+TWITTER_OAUTH_STATE_TTL = timedelta(minutes=10)
+
+_fernet_singleton = None
+
+
+def _fernet():
+    """Fernet по ключу TWITTER_TOKEN_KEY (ленивая инициализация).
+
+    Бросает, если ключ не задан/битый — токены X нельзя хранить в открытом виде.
+    """
+    global _fernet_singleton
+    if _fernet_singleton is None:
+        from cryptography.fernet import Fernet
+
+        key = os.getenv("TWITTER_TOKEN_KEY")
+        if not key:
+            raise RuntimeError(
+                "TWITTER_TOKEN_KEY yo'q — X tokenlarini shifrlab bo'lmaydi "
+                "(Fernet.generate_key() bilan yarating)."
+            )
+        _fernet_singleton = Fernet(key.encode() if isinstance(key, str) else key)
+    return _fernet_singleton
+
+
+def _enc(value: str) -> str:
+    return _fernet().encrypt((value or "").encode()).decode()
+
+
+def _dec(value: str) -> str:
+    return _fernet().decrypt((value or "").encode()).decode()
+
+
+def create_twitter_oauth_state(tenant_id: str, state: str, code_verifier: str) -> None:
+    """Сохраняет pending OAuth-состояние (state → tenant_id, code_verifier)."""
+    with Session(engine, expire_on_commit=False) as session:
+        session.add(
+            TwitterOAuthState(
+                state=state, tenant_id=tenant_id, code_verifier=code_verifier
+            )
+        )
+        session.commit()
+
+
+def pop_twitter_oauth_state(state: str) -> Optional[TwitterOAuthState]:
+    """Возвращает и УДАЛЯЕТ pending-состояние (одноразовость). None — нет/протухло."""
+    with Session(engine, expire_on_commit=False) as session:
+        row = session.exec(
+            select(TwitterOAuthState).where(TwitterOAuthState.state == state)
+        ).first()
+        if not row:
+            return None
+        session.delete(row)
+        session.commit()
+        created = row.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if _utcnow() - created > TWITTER_OAUTH_STATE_TTL:
+            return None
+        return row
+
+
+def upsert_twitter_account(
+    tenant_id: str,
+    twitter_user_id: str,
+    screen_name: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: datetime,
+) -> TwitterAccount:
+    """Создаёт/обновляет привязку X-аккаунта к тенанту (токены шифруются)."""
+    with Session(engine, expire_on_commit=False) as session:
+        acc = session.exec(
+            select(TwitterAccount).where(TwitterAccount.tenant_id == tenant_id)
+        ).first()
+        if acc is None:
+            acc = TwitterAccount(tenant_id=tenant_id, twitter_user_id=twitter_user_id)
+        acc.twitter_user_id = twitter_user_id
+        acc.screen_name = screen_name
+        acc.access_token_enc = _enc(access_token)
+        acc.refresh_token_enc = _enc(refresh_token)
+        acc.token_expires_at = expires_at
+        acc.active = True
+        acc.updated_at = _utcnow()
+        session.add(acc)
+        session.commit()
+        session.refresh(acc)
+        return acc
+
+
+def get_twitter_account(tenant_id: str) -> Optional[dict]:
+    """Подключённый X-аккаунт тенанта с РАСШИФРОВАННЫМИ токенами, либо None.
+
+    Возвращает dict (а не ORM-объект), чтобы вызывающий publisher не тянул сессию
+    и работал с уже готовыми access/refresh-токенами.
+    """
+    with Session(engine, expire_on_commit=False) as session:
+        acc = session.exec(
+            select(TwitterAccount).where(TwitterAccount.tenant_id == tenant_id)
+        ).first()
+        if not acc:
+            return None
+        expires = acc.token_expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return {
+            "tenant_id": acc.tenant_id,
+            "twitter_user_id": acc.twitter_user_id,
+            "screen_name": acc.screen_name,
+            "access_token": _dec(acc.access_token_enc),
+            "refresh_token": _dec(acc.refresh_token_enc),
+            "token_expires_at": expires,
+            "active": acc.active,
+        }
+
+
+def update_twitter_tokens(
+    tenant_id: str, access_token: str, refresh_token: str, expires_at: datetime
+) -> None:
+    """Обновляет токены после рефреша (X ротирует refresh_token при каждом рефреше)."""
+    with Session(engine, expire_on_commit=False) as session:
+        acc = session.exec(
+            select(TwitterAccount).where(TwitterAccount.tenant_id == tenant_id)
+        ).first()
+        if not acc:
+            return
+        acc.access_token_enc = _enc(access_token)
+        acc.refresh_token_enc = _enc(refresh_token)
+        acc.token_expires_at = expires_at
+        acc.updated_at = _utcnow()
+        session.add(acc)
+        session.commit()
+
+
+def remove_twitter_account(tenant_id: str) -> bool:
+    """Отвязывает X-аккаунт от тенанта. True — что-то удалили."""
+    with Session(engine, expire_on_commit=False) as session:
+        acc = session.exec(
+            select(TwitterAccount).where(TwitterAccount.tenant_id == tenant_id)
+        ).first()
+        if not acc:
+            return False
+        session.delete(acc)
+        session.commit()
+        return True
+
+
 def remove_tenant(chat_id: str) -> bool:
     """Удаляет арендатора вместе с его правилами (история сохраняется для аудита)."""
     with Session(engine, expire_on_commit=False) as session:
@@ -756,6 +943,10 @@ def remove_tenant(chat_id: str) -> bool:
             select(TenantRule).where(TenantRule.tenant_id == profile.tenant_id)
         ).all():
             session.delete(rule)
+        for acc in session.exec(
+            select(TwitterAccount).where(TwitterAccount.tenant_id == profile.tenant_id)
+        ).all():
+            session.delete(acc)
         session.delete(profile)
         session.commit()
         return True

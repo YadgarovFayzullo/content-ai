@@ -1392,3 +1392,67 @@ def generate_illustration(ctx: GenerationContext, subject: str) -> str:
         return str(file_path)
     except Exception as e:
         raise RuntimeError(f"Rasm yaratib bo'lmadi: {e}")
+
+
+# --- Короткая версия под X/Twitter -------------------------------------------
+
+# Жёсткий лимит твита. Оставляем небольшой запас на случай, если модель
+# чуть промахнётся — финальная гарантия всё равно режет по _tweet_fallback.
+TWEET_LIMIT = 280
+
+
+def _tweet_fallback(text: str) -> str:
+    """Детерминированный фолбэк, если LLM недоступна: снять HTML и обрезать под лимит."""
+    plain = _visible_text(text)
+    if len(plain) <= TWEET_LIMIT:
+        return plain
+    return _truncate_to_limit(plain, TWEET_LIMIT - 1).rstrip() + "…"
+
+
+def tweetify(profile, text: str) -> str:
+    """Ужимает готовый пост канала в один твит (≤280 символов, plain-text).
+
+    Кросс-постинг в X: текст поста (HTML, длинный) пересобирается LLM в короткую
+    самодостаточную версию на языке канала. Хэштеги/эмодзи — по тумблерам профиля.
+    При любом сбое LLM — детерминированный фолбэк (снять HTML + обрезать), чтобы
+    кросс-пост не срывался. Гарантированно возвращает строку ≤280 символов.
+    """
+    plain = _visible_text(text)
+    # Уже коротко — незачем жечь вызов LLM.
+    if len(plain) <= TWEET_LIMIT:
+        return plain
+
+    lang = _language_name(getattr(profile, "language", "uz"))
+    use_emoji = getattr(profile, "use_emoji", True)
+    use_hashtags = getattr(profile, "use_hashtags", False)
+    system = (
+        "You compress a social media post into a SINGLE tweet. Output ONLY the "
+        "tweet text — no quotes, no preamble, no markdown, no HTML."
+    )
+    user = "\n".join(
+        [
+            f"Rewrite the post below as ONE tweet in {lang}.",
+            f"HARD LIMIT: at most {TWEET_LIMIT} characters (count every character).",
+            "Keep the single most important point; plain text only.",
+            ("A few relevant emojis are OK." if use_emoji else "No emojis."),
+            (
+                "You may add 1–2 relevant hashtags at the end if they fit."
+                if use_hashtags
+                else "No hashtags."
+            ),
+            "",
+            "## POST",
+            plain,
+        ]
+    )
+    try:
+        out = groq_chat(system, user, temperature=0.4).strip()
+    except Exception:
+        return _tweet_fallback(text)
+    # Модель иногда оборачивает в кавычки или превышает лимит — чистим и гарантируем.
+    out = out.strip().strip('"').strip()
+    if not out:
+        return _tweet_fallback(text)
+    if len(out) > TWEET_LIMIT:
+        out = _truncate_to_limit(out, TWEET_LIMIT - 1).rstrip() + "…"
+    return out

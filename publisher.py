@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from database import save_post, save_repost_story, get_tenant_profile
 from orchestrator import GeneratedContent
 from tiers import allows
+from twitter_publisher import cross_post
 
 load_dotenv()
 
@@ -198,6 +199,14 @@ async def send_to_telegram(
             await asyncio.to_thread(
                 save_repost_story, entry.tenant_id, story_vec, story_keys, post_text[:200]
             )
+
+        # Кросс-пост в привязанный X-аккаунт (короткая ≤280-версия). Берём
+        # ОРИГИНАЛЬНЫЙ текст (без Telegram-атрибуции). Best-effort: сбой X не должен
+        # ронять уже успешную публикацию в Telegram, поэтому глушим исключения.
+        try:
+            await cross_post(entry.tenant_id, content["text"], image_path)
+        except Exception as e:
+            print(f"Twitter cross-post o'tkazib yuborildi ({target_chat_id}): {e}")
 
         if ADMIN_ID:
             post_url = (

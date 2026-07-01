@@ -15,3 +15,4 @@ playwright
 tzdata
 fastapi
 uvicorn[standard]
+cryptography

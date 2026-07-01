@@ -12,6 +12,7 @@ from typing import Optional, List, Tuple
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import asyncio
 import hashlib
@@ -46,6 +47,9 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 # bridge-сети content_ai_net — ходим по имени сервиса `bot:8002`. Общий секрет —
 # ADMIN_TOKEN из .env (заголовок X-Internal-Token).
 INTERNAL_BOT_URL = os.getenv("INTERNAL_BOT_URL", "http://bot:8002")
+
+# Куда вернуть пользователя после OAuth-подключения X (страница настроек панели).
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 from database import (
     TenantProfile,
     get_all_tenants,
@@ -86,7 +90,13 @@ from database import (
     add_chat_message,
     rename_chat_session,
     delete_chat_session,
+    create_twitter_oauth_state,
+    pop_twitter_oauth_state,
+    upsert_twitter_account,
+    get_twitter_account,
+    remove_twitter_account,
 )
+import twitter_publisher
 from tiers import (
     TIER_LIMITS,
     BASIC_ANALYTICS_MAX_DAYS,
@@ -1972,6 +1982,103 @@ async def delete_tenant_endpoint(
         pass
 
     return {"success": True}
+
+
+# ============================================================================
+# X / Twitter — подключение аккаунта (OAuth2) и кросс-постинг
+# ============================================================================
+
+@app.post("/api/admin/tenants/{tenant_id}/twitter/connect", tags=["Twitter"])
+async def twitter_connect(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Начинает OAuth2-подключение X-аккаунта: отдаёт authorize URL.
+
+    Фронт открывает этот URL; после авторизации X редиректит на наш callback.
+    """
+    await _require_tenant(principal, tenant_id)
+    if not twitter_publisher.is_configured():
+        raise HTTPException(status_code=503, detail="Twitter integration is not configured")
+
+    verifier, challenge = twitter_publisher.new_pkce()
+    state = twitter_publisher.new_state()
+    await asyncio.to_thread(create_twitter_oauth_state, tenant_id, state, verifier)
+    authorize_url = twitter_publisher.build_authorize_url(state, challenge)
+    return {"authorize_url": authorize_url}
+
+
+@app.get("/api/admin/twitter/callback", tags=["Twitter"])
+async def twitter_callback(
+    state: str = Query(...),
+    code: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+):
+    """Callback X: меняет code на токены, сохраняет привязку, редиректит в панель.
+
+    Публичный (X редиректит сюда браузер пользователя) — доверие держится на
+    одноразовом state, который мы сами выдали в /twitter/connect.
+    """
+    pending = await asyncio.to_thread(pop_twitter_oauth_state, state)
+    if not pending:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+    if error or not code:
+        return _twitter_redirect("error")
+
+    try:
+        tokens = await twitter_publisher.exchange_code(code, pending.code_verifier)
+        me = await twitter_publisher.fetch_me(tokens["access_token"])
+    except Exception as e:
+        logging.warning("Twitter OAuth exchange xatosi (%s): %s", pending.tenant_id, e)
+        return _twitter_redirect("error")
+
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=int(tokens.get("expires_in", 7200))
+    )
+    await asyncio.to_thread(
+        upsert_twitter_account,
+        pending.tenant_id,
+        str(me.get("id", "")),
+        me.get("username", ""),
+        tokens["access_token"],
+        tokens.get("refresh_token", ""),
+        expires_at,
+    )
+    return _twitter_redirect("connected")
+
+
+def _twitter_redirect(status: str) -> RedirectResponse:
+    """Возврат в панель после OAuth (или простой текст, если FRONTEND_URL не задан)."""
+    if FRONTEND_URL:
+        return RedirectResponse(url=f"{FRONTEND_URL}?twitter={status}")
+    return RedirectResponse(url=f"/?twitter={status}")
+
+
+@app.get("/api/admin/tenants/{tenant_id}/twitter", tags=["Twitter"])
+async def twitter_status(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Статус подключения X: {connected, screen_name}."""
+    await _require_tenant(principal, tenant_id)
+    account = await asyncio.to_thread(get_twitter_account, tenant_id)
+    if not account:
+        return {"connected": False, "screen_name": None}
+    return {
+        "connected": bool(account.get("active")),
+        "screen_name": account.get("screen_name") or None,
+    }
+
+
+@app.delete("/api/admin/tenants/{tenant_id}/twitter", tags=["Twitter"])
+async def twitter_disconnect(
+    tenant_id: str,
+    principal: Principal = Depends(get_principal),
+):
+    """Отключает X-аккаунт от канала (кросс-постинг прекращается)."""
+    await _require_tenant(principal, tenant_id)
+    removed = await asyncio.to_thread(remove_twitter_account, tenant_id)
+    return {"success": removed}
 
 
 @app.post("/api/admin/tenants/{tenant_id}/publish", tags=["Publish"])
