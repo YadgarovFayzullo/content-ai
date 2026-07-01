@@ -2023,13 +2023,24 @@ async def twitter_callback(
     if not pending:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
     if error or not code:
+        # X отклонил авторизацию (пользователь отменил, invalid_scope, misconfig).
+        # Логируем причину — иначе на фронте виден только глухой «error».
+        logging.warning(
+            "Twitter OAuth denied (%s): error=%r code_present=%s",
+            pending.tenant_id, error, bool(code),
+        )
         return _twitter_redirect("error")
 
     try:
         tokens = await twitter_publisher.exchange_code(code, pending.code_verifier)
         me = await twitter_publisher.fetch_me(tokens["access_token"])
     except Exception as e:
-        logging.warning("Twitter OAuth exchange xatosi (%s): %s", pending.tenant_id, e)
+        # Тело ответа X содержит настоящую причину (redirect_uri_mismatch,
+        # invalid_client, invalid_scope) — httpx-исключение само её не печатает.
+        detail = getattr(getattr(e, "response", None), "text", "")
+        logging.warning(
+            "Twitter OAuth exchange xatosi (%s): %s %s", pending.tenant_id, e, detail
+        )
         return _twitter_redirect("error")
 
     expires_at = datetime.now(timezone.utc) + timedelta(
